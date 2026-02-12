@@ -1,6 +1,6 @@
 import path from "node:path";
 import { createAnalyzerContext } from "./analyzer";
-import type { AnalyzerConfig, ImpactDependent, ImpactItem, ImpactReport, ImpactSite, StateSymbol } from "./types";
+import type { AnalyzerConfig, ImpactDependent, ImpactItem, ImpactReport, ImpactSite, StateSymbol, UsageEvent } from "./types";
 
 export interface ImpactQuery {
   state?: string;
@@ -29,35 +29,9 @@ export function runImpact(config: AnalyzerConfig, query: ImpactQuery): ImpactRep
 
   const items: ImpactItem[] = targets
     .map((state) => {
-      const directReaders: ImpactSite[] = context.usageEvents
-        .filter((event) => event.stateId === state.id && event.type === "read")
-        .map((event) => ({
-          actor: event.actorName,
-          file: event.filePath,
-          line: event.line,
-          column: event.column,
-          via: event.via,
-        }));
-
-      const runtimeWriters: ImpactSite[] = context.usageEvents
-        .filter((event) => event.stateId === state.id && event.type === "runtimeWrite")
-        .map((event) => ({
-          actor: event.actorName,
-          file: event.filePath,
-          line: event.line,
-          column: event.column,
-          via: event.via,
-        }));
-
-      const initWriters: ImpactSite[] = context.usageEvents
-        .filter((event) => event.stateId === state.id && event.type === "initWrite")
-        .map((event) => ({
-          actor: event.actorName,
-          file: event.filePath,
-          line: event.line,
-          column: event.column,
-          via: event.via,
-        }));
+      const directReaders = collectImpactSites(context.usageEvents, state.id, "read");
+      const runtimeWriters = collectImpactSites(context.usageEvents, state.id, "runtimeWrite");
+      const initWriters = collectImpactSites(context.usageEvents, state.id, "initWrite");
 
       const transitiveDependents = collectTransitiveDependents(state.id, depth, reverseDependencyMap, context.stateById);
 
@@ -95,6 +69,22 @@ export function runImpact(config: AnalyzerConfig, query: ImpactQuery): ImpactRep
     },
     items,
   };
+}
+
+function collectImpactSites(
+  usageEvents: UsageEvent[],
+  stateId: string,
+  eventType: "read" | "runtimeWrite" | "initWrite",
+): ImpactSite[] {
+  return usageEvents
+    .filter((event) => event.stateId === stateId && event.type === eventType)
+    .map((event) => ({
+      actor: event.actorName,
+      file: event.filePath,
+      line: event.line,
+      column: event.column,
+      via: event.via,
+    }));
 }
 
 function resolveStateTargets(states: StateSymbol[], stateName: string): StateSymbol[] {

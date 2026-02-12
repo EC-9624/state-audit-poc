@@ -47,22 +47,10 @@ export function toSerializableImpactReport(report: ImpactReport): ImpactReport {
         ...item.definition,
         file: toDisplayPath(item.definition.file),
       },
-      directReaders: item.directReaders.map((reader) => ({
-        ...reader,
-        file: toDisplayPath(reader.file),
-      })),
-      runtimeWriters: item.runtimeWriters.map((writer) => ({
-        ...writer,
-        file: toDisplayPath(writer.file),
-      })),
-      initWriters: item.initWriters.map((writer) => ({
-        ...writer,
-        file: toDisplayPath(writer.file),
-      })),
-      transitiveDependents: item.transitiveDependents.map((dependent) => ({
-        ...dependent,
-        file: toDisplayPath(dependent.file),
-      })),
+      directReaders: mapWithDisplayPath(item.directReaders),
+      runtimeWriters: mapWithDisplayPath(item.runtimeWriters),
+      initWriters: mapWithDisplayPath(item.initWriters),
+      transitiveDependents: mapWithDisplayPath(item.transitiveDependents),
     })),
   };
 }
@@ -100,4 +88,11 @@ export function renderImpactText(report: ImpactReport): string {
   }
 
   return lines.join("\n");
+}
+
+function mapWithDisplayPath<T extends { file: string }>(items: T[]): T[] {
+  return items.map((item) => ({
+    ...item,
+    file: toDisplayPath(item.file),
+  }));
 }
