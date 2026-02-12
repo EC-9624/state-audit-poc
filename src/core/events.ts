@@ -2,8 +2,12 @@ import {
   Node,
   SyntaxKind,
   type ArrowFunction,
+  type BindingName,
   type CallExpression,
+  type Expression,
+  type FunctionDeclaration,
   type FunctionExpression,
+  type MethodDeclaration,
   type SourceFile,
   type Symbol as MorphSymbol,
 } from "ts-morph";
@@ -14,6 +18,25 @@ import {
   type SymbolIndex,
 } from "./symbols";
 import type { DependencyEdge, UsageEvent } from "./types";
+
+type CallbackFactoryFunction = ArrowFunction | FunctionExpression | FunctionDeclaration;
+type FunctionLikeNode = ArrowFunction | FunctionExpression | FunctionDeclaration | MethodDeclaration;
+type WriteEventType = "runtimeWrite" | "initWrite";
+
+interface RecoilCallbackBindings {
+  contextNames: Set<string>;
+  snapshotNames: Set<string>;
+  getNames: Set<string>;
+  setNames: Set<string>;
+  resetNames: Set<string>;
+}
+
+interface JotaiAtomCallbackBindings {
+  getName: string;
+  setName: string;
+}
+
+const RECOIL_SNAPSHOT_READ_METHODS = new Set(["get", "getPromise", "getLoadable"]);
 
 export interface EventExtractionResult {
   usageEvents: UsageEvent[];
@@ -35,21 +58,23 @@ export function buildUsageEvents(sourceFiles: SourceFile[], index: SymbolIndex):
         usageEvents.push(runtimeRead);
       }
 
-      const hookWrite = importMap ? classifyHookWritePotential(callExpression, importMap, index) : undefined;
-      if (hookWrite) {
-        usageEvents.push(hookWrite);
-      }
-
       const setterWrite = classifySetterWriteCall(callExpression, setterSymbolToStateId);
       if (setterWrite) {
         usageEvents.push(setterWrite);
       }
 
-      const directSetWrite = classifyDirectSetWrite(callExpression, index);
-      if (directSetWrite) {
-        usageEvents.push(directSetWrite);
+      const directMutationWrite = classifyDirectMutationWrite(callExpression, index);
+      if (directMutationWrite) {
+        usageEvents.push(directMutationWrite);
       }
     }
+
+    if (importMap) {
+      usageEvents.push(...extractRecoilCallbackEvents(sourceFile, importMap, index));
+      usageEvents.push(...extractJotaiAtomCallbackEvents(sourceFile, importMap, index));
+    }
+
+    usageEvents.push(...extractSetterReferenceWriteEvents(sourceFile, setterSymbolToStateId));
   }
 
   for (const ownerState of index.states) {
@@ -158,7 +183,7 @@ function buildSetterBindings(sourceFiles: SourceFile[], index: SymbolIndex): Map
       continue;
     }
 
-    for (const declaration of sourceFile.getVariableDeclarations()) {
+    for (const declaration of sourceFile.getDescendantsOfKind(SyntaxKind.VariableDeclaration)) {
       const initCall = declaration.getInitializerIfKind(SyntaxKind.CallExpression);
       if (!initCall) {
         continue;
@@ -171,7 +196,9 @@ function buildSetterBindings(sourceFiles: SourceFile[], index: SymbolIndex): Map
 
       const isSetHook =
         (factory.module === "recoil" &&
-          (factory.imported === "useSetRecoilState" || factory.imported === "useRecoilState")) ||
+          (factory.imported === "useSetRecoilState" ||
+            factory.imported === "useRecoilState" ||
+            factory.imported === "useResetRecoilState")) ||
         (factory.module === "jotai" && (factory.imported === "useSetAtom" || factory.imported === "useAtom"));
 
       if (!isSetHook) {
@@ -183,7 +210,11 @@ function buildSetterBindings(sourceFiles: SourceFile[], index: SymbolIndex): Map
         continue;
       }
 
-      if (factory.imported === "useSetRecoilState" || factory.imported === "useSetAtom") {
+      if (
+        factory.imported === "useSetRecoilState" ||
+        factory.imported === "useSetAtom" ||
+        factory.imported === "useResetRecoilState"
+      ) {
         const nameNode = declaration.getNameNode();
         if (Node.isIdentifier(nameNode)) {
           const symbolKey = getSymbolKey(nameNode);
@@ -243,8 +274,7 @@ function classifyRuntimeRead(
         factory.imported === "useRecoilValueLoadable" ||
         factory.imported === "useRecoilState" ||
         factory.imported === "useRecoilStateLoadable")) ||
-    (factory.module === "jotai" &&
-      (factory.imported === "useAtomValue" || factory.imported === "useAtom"));
+    (factory.module === "jotai" && (factory.imported === "useAtomValue" || factory.imported === "useAtom"));
 
   if (!isReadHook) {
     return undefined;
@@ -269,44 +299,6 @@ function classifyRuntimeRead(
   };
 }
 
-function classifyHookWritePotential(
-  callExpression: CallExpression,
-  importMap: ImportMap,
-  index: SymbolIndex,
-): UsageEvent | undefined {
-  const factory = resolveCalledFactory(callExpression, importMap);
-  if (!factory) {
-    return undefined;
-  }
-
-  const isWriteCapableHook =
-    (factory.module === "recoil" &&
-      (factory.imported === "useRecoilState" || factory.imported === "useSetRecoilState")) ||
-    (factory.module === "jotai" && (factory.imported === "useAtom" || factory.imported === "useSetAtom"));
-
-  if (!isWriteCapableHook) {
-    return undefined;
-  }
-
-  const targetState = resolveStateFromExpression(callExpression.getArguments()[0], index);
-  if (!targetState) {
-    return undefined;
-  }
-
-  const location = getLocation(callExpression);
-  return {
-    type: "runtimeWrite",
-    phase: "runtime",
-    stateId: targetState.id,
-    actorType: "function",
-    actorName: getContainingFunctionName(callExpression),
-    filePath: callExpression.getSourceFile().getFilePath(),
-    line: location.line,
-    column: location.column,
-    via: `${factory.module}:${factory.imported}:hook`,
-  };
-}
-
 function classifySetterWriteCall(
   callExpression: CallExpression,
   setterSymbolToStateId: Map<string, string>,
@@ -325,8 +317,9 @@ function classifySetterWriteCall(
   }
 
   const location = getLocation(callExpression);
+  const writeType = classifyWriteType(callExpression);
   return {
-    type: "runtimeWrite",
+    type: writeType,
     phase: "runtime",
     stateId: targetStateId,
     actorType: "function",
@@ -334,16 +327,50 @@ function classifySetterWriteCall(
     filePath: callExpression.getSourceFile().getFilePath(),
     line: location.line,
     column: location.column,
-    via: "hook-setter-call",
+    via: writeType === "initWrite" ? "initializeState:hook-setter-call" : "hook-setter-call",
   };
 }
 
-function classifyDirectSetWrite(callExpression: CallExpression, index: SymbolIndex): UsageEvent | undefined {
-  const callee = callExpression.getExpression();
-  const isSetCall =
-    (Node.isIdentifier(callee) && callee.getText() === "set") ||
-    (Node.isPropertyAccessExpression(callee) && callee.getName() === "set");
-  if (!isSetCall) {
+function extractSetterReferenceWriteEvents(
+  sourceFile: SourceFile,
+  setterSymbolToStateId: Map<string, string>,
+): UsageEvent[] {
+  const events: UsageEvent[] = [];
+
+  for (const identifier of sourceFile.getDescendantsOfKind(SyntaxKind.Identifier)) {
+    if (!isSetterReferenceWriteSite(identifier)) {
+      continue;
+    }
+
+    const symbolKey = getSymbolKey(identifier);
+    const targetStateId =
+      (symbolKey ? setterSymbolToStateId.get(`sym|${symbolKey}`) : undefined) ??
+      setterSymbolToStateId.get(getFallbackSetterKey(sourceFile.getFilePath(), identifier.getText()));
+    if (!targetStateId) {
+      continue;
+    }
+
+    const location = getLocation(identifier);
+    const writeType = classifyWriteType(identifier);
+    events.push({
+      type: writeType,
+      phase: "runtime",
+      stateId: targetStateId,
+      actorType: "function",
+      actorName: getContainingFunctionName(identifier),
+      filePath: sourceFile.getFilePath(),
+      line: location.line,
+      column: location.column,
+      via: writeType === "initWrite" ? "initializeState:hook-setter-reference" : "hook-setter-reference",
+    });
+  }
+
+  return events;
+}
+
+function classifyDirectMutationWrite(callExpression: CallExpression, index: SymbolIndex): UsageEvent | undefined {
+  const mutationKind = resolveMutationKind(callExpression.getExpression());
+  if (!mutationKind) {
     return undefined;
   }
 
@@ -353,10 +380,18 @@ function classifyDirectSetWrite(callExpression: CallExpression, index: SymbolInd
   }
 
   const location = getLocation(callExpression);
-  const initContext = isInitWriteContext(callExpression);
+  const writeType = classifyWriteType(callExpression);
+  const via =
+    mutationKind === "set"
+      ? writeType === "initWrite"
+        ? "initializeState:set"
+        : "set-call"
+      : writeType === "initWrite"
+        ? "initializeState:reset"
+        : "reset-call";
 
   return {
-    type: initContext ? "initWrite" : "runtimeWrite",
+    type: writeType,
     phase: "runtime",
     stateId: targetState.id,
     actorType: "function",
@@ -364,8 +399,420 @@ function classifyDirectSetWrite(callExpression: CallExpression, index: SymbolInd
     filePath: callExpression.getSourceFile().getFilePath(),
     line: location.line,
     column: location.column,
-    via: initContext ? "initializeState:set" : "set-call",
+    via,
   };
+}
+
+function extractRecoilCallbackEvents(
+  sourceFile: SourceFile,
+  importMap: ImportMap,
+  index: SymbolIndex,
+): UsageEvent[] {
+  const events: UsageEvent[] = [];
+
+  for (const callExpression of sourceFile.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+    const factory = resolveCalledFactory(callExpression, importMap);
+    if (!factory || factory.module !== "recoil" || factory.imported !== "useRecoilCallback") {
+      continue;
+    }
+
+    const callbackFactory = resolveCallbackFactoryFunction(callExpression.getArguments()[0], importMap);
+    if (!callbackFactory) {
+      continue;
+    }
+
+    const bindings = parseRecoilCallbackBindings(callbackFactory);
+    for (const innerCall of callbackFactory.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+      const readEvent = classifyRecoilCallbackRead(innerCall, bindings, index);
+      if (readEvent) {
+        events.push(readEvent);
+      }
+
+      const writeEvent = classifyRecoilCallbackWrite(innerCall, bindings, index);
+      if (writeEvent) {
+        events.push(writeEvent);
+      }
+    }
+  }
+
+  return events;
+}
+
+function extractJotaiAtomCallbackEvents(
+  sourceFile: SourceFile,
+  importMap: ImportMap,
+  index: SymbolIndex,
+): UsageEvent[] {
+  const events: UsageEvent[] = [];
+
+  for (const callExpression of sourceFile.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+    const factory = resolveCalledFactory(callExpression, importMap);
+    if (!factory || factory.module !== "jotai/utils" || factory.imported !== "useAtomCallback") {
+      continue;
+    }
+
+    const callbackFactory = resolveCallbackFactoryFunction(callExpression.getArguments()[0], importMap);
+    if (!callbackFactory) {
+      continue;
+    }
+
+    const bindings = parseJotaiAtomCallbackBindings(callbackFactory);
+    for (const innerCall of callbackFactory.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+      const readEvent = classifyJotaiAtomCallbackRead(innerCall, bindings, index);
+      if (readEvent) {
+        events.push(readEvent);
+      }
+
+      const writeEvent = classifyJotaiAtomCallbackWrite(innerCall, bindings, index);
+      if (writeEvent) {
+        events.push(writeEvent);
+      }
+    }
+  }
+
+  return events;
+}
+
+function parseRecoilCallbackBindings(callbackFactory: CallbackFactoryFunction): RecoilCallbackBindings {
+  const bindings: RecoilCallbackBindings = {
+    contextNames: new Set<string>(),
+    snapshotNames: new Set<string>(),
+    getNames: new Set<string>(),
+    setNames: new Set<string>(),
+    resetNames: new Set<string>(),
+  };
+
+  const contextParameter = callbackFactory.getParameters()[0];
+  if (!contextParameter) {
+    return bindings;
+  }
+
+  const parameterNameNode = contextParameter.getNameNode();
+  if (Node.isIdentifier(parameterNameNode)) {
+    bindings.contextNames.add(parameterNameNode.getText());
+    return bindings;
+  }
+
+  if (!Node.isObjectBindingPattern(parameterNameNode)) {
+    return bindings;
+  }
+
+  for (const element of parameterNameNode.getElements()) {
+    const propertyName = element.getPropertyNameNode()?.getText() ?? element.getName();
+    const localNameNode = element.getNameNode();
+
+    if (propertyName === "set") {
+      collectIdentifiersFromBindingName(localNameNode, bindings.setNames);
+      continue;
+    }
+
+    if (propertyName === "reset") {
+      collectIdentifiersFromBindingName(localNameNode, bindings.resetNames);
+      continue;
+    }
+
+    if (propertyName !== "snapshot") {
+      continue;
+    }
+
+    if (Node.isIdentifier(localNameNode)) {
+      bindings.snapshotNames.add(localNameNode.getText());
+      continue;
+    }
+
+    if (!Node.isObjectBindingPattern(localNameNode)) {
+      continue;
+    }
+
+    for (const snapshotElement of localNameNode.getElements()) {
+      const snapshotPropertyName = snapshotElement.getPropertyNameNode()?.getText() ?? snapshotElement.getName();
+      if (!RECOIL_SNAPSHOT_READ_METHODS.has(snapshotPropertyName)) {
+        continue;
+      }
+      collectIdentifiersFromBindingName(snapshotElement.getNameNode(), bindings.getNames);
+    }
+  }
+
+  return bindings;
+}
+
+function parseJotaiAtomCallbackBindings(callbackFactory: CallbackFactoryFunction): JotaiAtomCallbackBindings {
+  return {
+    getName: getParameterNameOrDefault(callbackFactory.getParameters()[0], "get"),
+    setName: getParameterNameOrDefault(callbackFactory.getParameters()[1], "set"),
+  };
+}
+
+function classifyRecoilCallbackRead(
+  callExpression: CallExpression,
+  bindings: RecoilCallbackBindings,
+  index: SymbolIndex,
+): UsageEvent | undefined {
+  const targetState = resolveStateFromExpression(callExpression.getArguments()[0], index);
+  if (!targetState) {
+    return undefined;
+  }
+
+  const callee = callExpression.getExpression();
+  let via: string | undefined;
+
+  if (Node.isIdentifier(callee) && bindings.getNames.has(callee.getText())) {
+    via = `recoil:snapshot.${callee.getText()}`;
+  }
+
+  if (Node.isPropertyAccessExpression(callee)) {
+    const methodName = callee.getName();
+    if (RECOIL_SNAPSHOT_READ_METHODS.has(methodName) && isRecoilSnapshotBase(callee.getExpression(), bindings)) {
+      via = `recoil:snapshot.${methodName}`;
+    }
+  }
+
+  if (!via) {
+    return undefined;
+  }
+
+  const location = getLocation(callExpression);
+  return {
+    type: "read",
+    phase: "runtime",
+    stateId: targetState.id,
+    actorType: "function",
+    actorName: getContainingFunctionName(callExpression),
+    filePath: callExpression.getSourceFile().getFilePath(),
+    line: location.line,
+    column: location.column,
+    via,
+  };
+}
+
+function classifyRecoilCallbackWrite(
+  callExpression: CallExpression,
+  bindings: RecoilCallbackBindings,
+  index: SymbolIndex,
+): UsageEvent | undefined {
+  const targetState = resolveStateFromExpression(callExpression.getArguments()[0], index);
+  if (!targetState) {
+    return undefined;
+  }
+
+  const mutationKind = resolveRecoilCallbackMutationKind(callExpression.getExpression(), bindings);
+  if (!mutationKind) {
+    return undefined;
+  }
+
+  const location = getLocation(callExpression);
+  const writeType = classifyWriteType(callExpression);
+  const via =
+    mutationKind === "set"
+      ? writeType === "initWrite"
+        ? "initializeState:set"
+        : "set-call"
+      : writeType === "initWrite"
+        ? "initializeState:reset"
+        : "reset-call";
+
+  return {
+    type: writeType,
+    phase: "runtime",
+    stateId: targetState.id,
+    actorType: "function",
+    actorName: getContainingFunctionName(callExpression),
+    filePath: callExpression.getSourceFile().getFilePath(),
+    line: location.line,
+    column: location.column,
+    via,
+  };
+}
+
+function classifyJotaiAtomCallbackRead(
+  callExpression: CallExpression,
+  bindings: JotaiAtomCallbackBindings,
+  index: SymbolIndex,
+): UsageEvent | undefined {
+  const callee = callExpression.getExpression();
+  if (!Node.isIdentifier(callee) || callee.getText() !== bindings.getName) {
+    return undefined;
+  }
+
+  const targetState = resolveStateFromExpression(callExpression.getArguments()[0], index);
+  if (!targetState) {
+    return undefined;
+  }
+
+  const location = getLocation(callExpression);
+  return {
+    type: "read",
+    phase: "runtime",
+    stateId: targetState.id,
+    actorType: "function",
+    actorName: getContainingFunctionName(callExpression),
+    filePath: callExpression.getSourceFile().getFilePath(),
+    line: location.line,
+    column: location.column,
+    via: "jotai:useAtomCallback:get",
+  };
+}
+
+function classifyJotaiAtomCallbackWrite(
+  callExpression: CallExpression,
+  bindings: JotaiAtomCallbackBindings,
+  index: SymbolIndex,
+): UsageEvent | undefined {
+  const callee = callExpression.getExpression();
+  if (!Node.isIdentifier(callee) || callee.getText() !== bindings.setName) {
+    return undefined;
+  }
+
+  const targetState = resolveStateFromExpression(callExpression.getArguments()[0], index);
+  if (!targetState) {
+    return undefined;
+  }
+
+  const location = getLocation(callExpression);
+  const writeType = classifyWriteType(callExpression);
+  return {
+    type: writeType,
+    phase: "runtime",
+    stateId: targetState.id,
+    actorType: "function",
+    actorName: getContainingFunctionName(callExpression),
+    filePath: callExpression.getSourceFile().getFilePath(),
+    line: location.line,
+    column: location.column,
+    via: writeType === "initWrite" ? "initializeState:set" : "set-call",
+  };
+}
+
+function resolveCallbackFactoryFunction(
+  callbackArgument: Node | undefined,
+  importMap: ImportMap,
+): CallbackFactoryFunction | undefined {
+  if (!callbackArgument) {
+    return undefined;
+  }
+
+  const directFunction = resolveFunctionFromNode(callbackArgument);
+  if (directFunction) {
+    return directFunction;
+  }
+
+  if (!Node.isCallExpression(callbackArgument)) {
+    return undefined;
+  }
+
+  const callbackFactory = resolveCalledFactory(callbackArgument, importMap);
+  if (!callbackFactory || callbackFactory.module !== "react" || callbackFactory.imported !== "useCallback") {
+    return undefined;
+  }
+
+  const wrappedFunction = callbackArgument.getArguments()[0];
+  return resolveFunctionFromNode(wrappedFunction);
+}
+
+function resolveFunctionFromNode(node: Node | undefined): CallbackFactoryFunction | undefined {
+  if (!node) {
+    return undefined;
+  }
+
+  if (Node.isArrowFunction(node) || Node.isFunctionExpression(node) || Node.isFunctionDeclaration(node)) {
+    return node;
+  }
+
+  if (!Node.isIdentifier(node)) {
+    return undefined;
+  }
+
+  const symbol = unwrapAliasedSymbol(node.getSymbol());
+  if (!symbol) {
+    return undefined;
+  }
+
+  for (const declaration of symbol.getDeclarations()) {
+    if (Node.isFunctionDeclaration(declaration)) {
+      return declaration;
+    }
+    if (Node.isVariableDeclaration(declaration)) {
+      const initializer = declaration.getInitializer();
+      if (initializer && (Node.isArrowFunction(initializer) || Node.isFunctionExpression(initializer))) {
+        return initializer;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function resolveRecoilCallbackMutationKind(
+  callee: Expression,
+  bindings: RecoilCallbackBindings,
+): "set" | "reset" | undefined {
+  if (Node.isIdentifier(callee)) {
+    const calleeName = callee.getText();
+    if (bindings.setNames.has(calleeName)) {
+      return "set";
+    }
+    if (bindings.resetNames.has(calleeName)) {
+      return "reset";
+    }
+    return undefined;
+  }
+
+  if (!Node.isPropertyAccessExpression(callee)) {
+    return undefined;
+  }
+
+  const methodName = callee.getName();
+  if (methodName !== "set" && methodName !== "reset") {
+    return undefined;
+  }
+
+  const base = callee.getExpression();
+  if (!Node.isIdentifier(base) || !bindings.contextNames.has(base.getText())) {
+    return undefined;
+  }
+
+  return methodName;
+}
+
+function isRecoilSnapshotBase(baseExpression: Expression, bindings: RecoilCallbackBindings): boolean {
+  if (Node.isIdentifier(baseExpression)) {
+    return bindings.snapshotNames.has(baseExpression.getText());
+  }
+
+  if (Node.isPropertyAccessExpression(baseExpression)) {
+    const propertyName = baseExpression.getName();
+    const objectExpression = baseExpression.getExpression();
+    return (
+      propertyName === "snapshot" &&
+      Node.isIdentifier(objectExpression) &&
+      bindings.contextNames.has(objectExpression.getText())
+    );
+  }
+
+  return false;
+}
+
+function resolveMutationKind(callee: Expression): "set" | "reset" | undefined {
+  if (Node.isIdentifier(callee)) {
+    const name = callee.getText();
+    if (name === "set" || name === "reset") {
+      return name;
+    }
+    return undefined;
+  }
+
+  if (Node.isPropertyAccessExpression(callee)) {
+    const name = callee.getName();
+    if (name === "set" || name === "reset") {
+      return name;
+    }
+  }
+
+  return undefined;
+}
+
+function classifyWriteType(node: Node): WriteEventType {
+  return isInitWriteContext(node) ? "initWrite" : "runtimeWrite";
 }
 
 function getRecoilReadFunctions(callExpression: CallExpression): Array<ArrowFunction | FunctionExpression> {
@@ -438,12 +885,18 @@ function getJotaiReadFunction(callExpression: CallExpression): ArrowFunction | F
 }
 
 function getJotaiGetParameterName(functionNode: ArrowFunction | FunctionExpression): string {
-  const firstParameter = functionNode.getParameters()[0];
-  const parameterNameNode = firstParameter?.getNameNode();
-  if (parameterNameNode && Node.isIdentifier(parameterNameNode)) {
-    return parameterNameNode.getText();
+  return getParameterNameOrDefault(functionNode.getParameters()[0], "get");
+}
+
+function getParameterNameOrDefault(
+  parameter: ReturnType<CallbackFactoryFunction["getParameters"]>[number] | undefined,
+  fallbackName: string,
+): string {
+  const nameNode = parameter?.getNameNode();
+  if (nameNode && Node.isIdentifier(nameNode)) {
+    return nameNode.getText();
   }
-  return "get";
+  return fallbackName;
 }
 
 function isRecoilGetCall(callExpression: CallExpression): boolean {
@@ -463,6 +916,39 @@ function isJotaiGetCall(callExpression: CallExpression, getParamName: string): b
 }
 
 function isInitWriteContext(node: Node): boolean {
+  if (isInsideInitializeStateProperty(node)) {
+    return true;
+  }
+
+  let current: Node | undefined = node;
+  while (current) {
+    if (isFunctionLikeNode(current)) {
+      const functionName = getFunctionLikeName(current);
+      if (functionName && functionName.startsWith("initialize")) {
+        return true;
+      }
+    }
+    current = current.getParent();
+  }
+
+  return false;
+}
+
+function isSetterReferenceWriteSite(identifier: Node): boolean {
+  if (!Node.isIdentifier(identifier)) {
+    return false;
+  }
+
+  const parent = identifier.getParent();
+  if (!parent || !Node.isJsxExpression(parent)) {
+    return false;
+  }
+
+  const attribute = parent.getParent();
+  return Node.isJsxAttribute(attribute) && attribute.getNameNode().getText().startsWith("on");
+}
+
+function isInsideInitializeStateProperty(node: Node): boolean {
   let current: Node | undefined = node;
   while (current) {
     if (Node.isJsxAttribute(current) && current.getNameNode().getText() === "initializeState") {
@@ -473,6 +959,7 @@ function isInitWriteContext(node: Node): boolean {
     }
     current = current.getParent();
   }
+
   return false;
 }
 
@@ -505,6 +992,41 @@ function getContainingFunctionName(node: Node): string {
 
   const variable = namedFunction.getFirstAncestorByKind(SyntaxKind.VariableDeclaration);
   return variable?.getName() ?? "<anonymous>";
+}
+
+function getFunctionLikeName(node: FunctionLikeNode): string | undefined {
+  if (Node.isFunctionDeclaration(node) || Node.isMethodDeclaration(node)) {
+    return node.getName() ?? undefined;
+  }
+
+  const variableDeclaration = node.getFirstAncestorByKind(SyntaxKind.VariableDeclaration);
+  if (variableDeclaration) {
+    return variableDeclaration.getName();
+  }
+
+  return undefined;
+}
+
+function isFunctionLikeNode(node: Node): node is FunctionLikeNode {
+  return (
+    Node.isArrowFunction(node) ||
+    Node.isFunctionExpression(node) ||
+    Node.isFunctionDeclaration(node) ||
+    Node.isMethodDeclaration(node)
+  );
+}
+
+function collectIdentifiersFromBindingName(bindingName: BindingName, target: Set<string>): void {
+  if (Node.isIdentifier(bindingName)) {
+    target.add(bindingName.getText());
+    return;
+  }
+
+  if (Node.isObjectBindingPattern(bindingName)) {
+    for (const element of bindingName.getElements()) {
+      collectIdentifiersFromBindingName(element.getNameNode(), target);
+    }
+  }
 }
 
 function getLocation(node: Node): { line: number; column: number } {

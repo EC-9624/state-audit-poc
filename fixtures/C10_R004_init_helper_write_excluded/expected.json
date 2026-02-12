@@ -1,0 +1,16 @@
+{
+  "ok": false,
+  "summary": {
+    "violations": 1
+  },
+  "violations": [
+    {
+      "rule": "R004",
+      "state": "staleCounterState",
+      "metrics": {
+        "runtimeWrites": 0,
+        "initWrites": 1
+      }
+    }
+  ]
+}

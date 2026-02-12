@@ -123,6 +123,13 @@ export function resolveStateFromExpression(node: Node | undefined, index: Symbol
     return undefined;
   }
 
+  if (Node.isCallExpression(node)) {
+    const calledExpressionMatch = resolveStateFromExpression(node.getExpression(), index);
+    if (calledExpressionMatch) {
+      return calledExpressionMatch;
+    }
+  }
+
   const symbol = unwrapAliasedSymbol(node.getSymbol());
   if (!symbol) {
     return undefined;
