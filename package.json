@@ -1,0 +1,22 @@
+{
+  "name": "state-audit-poc",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Standalone ts-morph POC for Recoil/Jotai migration audit and impact analysis",
+  "license": "UNLICENSED",
+  "scripts": {
+    "state:audit": "tsx src/cli/state-audit.ts",
+    "state:impact": "tsx src/cli/state-impact.ts",
+    "fixtures:run": "tsx src/cli/run-fixtures.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "minimatch": "^9.0.5",
+    "ts-morph": "^24.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}
