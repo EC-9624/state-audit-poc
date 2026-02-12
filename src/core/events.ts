@@ -17,7 +17,7 @@ import {
   type ImportMap,
   type SymbolIndex,
 } from "./symbols";
-import type { DependencyEdge, UsageEvent } from "./types";
+import type { DependencyEdge, StateSymbol, UsageEvent } from "./types";
 
 type CallbackFactoryFunction = ArrowFunction | FunctionExpression | FunctionDeclaration;
 type FunctionLikeNode = ArrowFunction | FunctionExpression | FunctionDeclaration | MethodDeclaration;
@@ -44,6 +44,12 @@ interface HookWriteBinding {
   objectSetterStateByProp?: Map<string, string>;
 }
 
+interface RecoilReadScope {
+  scopeNode: FunctionLikeNode;
+  getNames: Set<string>;
+  contextNames: Set<string>;
+}
+
 const RECOIL_SNAPSHOT_READ_METHODS = new Set(["get", "getPromise", "getLoadable"]);
 
 export interface EventExtractionResult {
@@ -55,6 +61,7 @@ export function buildUsageEvents(sourceFiles: SourceFile[], index: SymbolIndex):
   const usageEvents: UsageEvent[] = [];
   const dependencyEdges: DependencyEdge[] = [];
 
+  const jotaiStoreSymbolKeys = buildJotaiStoreSymbolKeys(sourceFiles, index);
   const directSetterSymbolToStateId = buildSetterBindings(sourceFiles, index);
   const setterSymbolToStateId = propagateSetterBindingsOneHop(sourceFiles, directSetterSymbolToStateId);
 
@@ -72,7 +79,12 @@ export function buildUsageEvents(sourceFiles: SourceFile[], index: SymbolIndex):
         usageEvents.push(setterWrite);
       }
 
-      const directMutationWrite = classifyDirectMutationWrite(callExpression, index);
+      const jotaiStoreSetWrite = classifyJotaiStoreSetWrite(callExpression, jotaiStoreSymbolKeys, index);
+      if (jotaiStoreSetWrite) {
+        usageEvents.push(jotaiStoreSetWrite);
+      }
+
+      const directMutationWrite = classifyDirectMutationWrite(callExpression, jotaiStoreSymbolKeys, index);
       if (directMutationWrite) {
         usageEvents.push(directMutationWrite);
       }
@@ -93,41 +105,23 @@ export function buildUsageEvents(sourceFiles: SourceFile[], index: SymbolIndex):
         continue;
       }
 
-      const readFunctions = getRecoilReadFunctions(initCall);
-      for (const readFunction of readFunctions) {
-        for (const getCall of readFunction.getDescendantsOfKind(SyntaxKind.CallExpression)) {
-          if (!isRecoilGetCall(getCall)) {
-            continue;
-          }
-          const targetState = resolveStateFromExpression(getCall.getArguments()[0], index);
-          if (!targetState) {
-            continue;
-          }
+      const readScopes = getRecoilReadScopes(initCall);
+      collectRecoilDependencyReads(ownerState, readScopes, jotaiStoreSymbolKeys, index, dependencyEdges, usageEvents);
+    }
 
-          const location = getLocation(getCall);
-          dependencyEdges.push({
-            fromStateId: ownerState.id,
-            toStateId: targetState.id,
-            filePath: getCall.getSourceFile().getFilePath(),
-            line: location.line,
-            column: location.column,
-            via: "recoil:get",
-          });
-
-          usageEvents.push({
-            type: "read",
-            phase: "dependency",
-            stateId: targetState.id,
-            actorType: "state",
-            actorName: ownerState.name,
-            actorStateId: ownerState.id,
-            filePath: getCall.getSourceFile().getFilePath(),
-            line: location.line,
-            column: location.column,
-            via: "recoil:get",
-          });
-        }
+    if (ownerState.store === "recoil" && ownerState.kind === "atom" && !ownerState.isRecoilPlainAtom) {
+      const initCall = index.initCallByStateId.get(ownerState.id);
+      if (!initCall) {
+        continue;
       }
+
+      const defaultSelectorCall = getRecoilAtomDefaultSelectorCall(initCall, index);
+      if (!defaultSelectorCall) {
+        continue;
+      }
+
+      const readScopes = getRecoilReadScopes(defaultSelectorCall);
+      collectRecoilDependencyReads(ownerState, readScopes, jotaiStoreSymbolKeys, index, dependencyEdges, usageEvents);
     }
 
     if (ownerState.store === "jotai" && (ownerState.kind === "derivedAtom" || ownerState.kind === "atomWithDefault")) {
@@ -214,6 +208,42 @@ function buildSetterBindings(sourceFiles: SourceFile[], index: SymbolIndex): Map
   }
 
   return setterSymbolToStateId;
+}
+
+function buildJotaiStoreSymbolKeys(sourceFiles: SourceFile[], index: SymbolIndex): Set<string> {
+  const keys = new Set<string>();
+
+  for (const sourceFile of sourceFiles) {
+    const importMap = index.importMapByFilePath.get(sourceFile.getFilePath());
+    if (!importMap) {
+      continue;
+    }
+
+    for (const declaration of sourceFile.getDescendantsOfKind(SyntaxKind.VariableDeclaration)) {
+      const initCall = declaration.getInitializerIfKind(SyntaxKind.CallExpression);
+      if (!initCall) {
+        continue;
+      }
+
+      const factory = resolveCalledFactory(initCall, importMap);
+      if (!factory || factory.module !== "jotai" || factory.imported !== "createStore") {
+        continue;
+      }
+
+      const nameNode = declaration.getNameNode();
+      if (!Node.isIdentifier(nameNode)) {
+        continue;
+      }
+
+      const symbolKey = getSymbolKey(nameNode);
+      if (symbolKey) {
+        keys.add(`sym|${symbolKey}`);
+      }
+      keys.add(getFallbackSetterKey(sourceFile.getFilePath(), nameNode.getText()));
+    }
+  }
+
+  return keys;
 }
 
 function resolveHookWriteBindingFromCallExpression(
@@ -827,6 +857,264 @@ function getJsxTagNameNode(jsxAttribute: Node): Node | undefined {
   return undefined;
 }
 
+function collectRecoilDependencyReads(
+  ownerState: StateSymbol,
+  readScopes: RecoilReadScope[],
+  jotaiStoreSymbolKeys: Set<string>,
+  index: SymbolIndex,
+  dependencyEdges: DependencyEdge[],
+  usageEvents: UsageEvent[],
+): void {
+  for (const readScope of readScopes) {
+    for (const callExpression of readScope.scopeNode.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+      const targetState = resolveStateFromExpression(callExpression.getArguments()[0], index);
+      if (!targetState) {
+        continue;
+      }
+
+      if (isRecoilGetCall(callExpression, readScope.getNames, readScope.contextNames)) {
+        pushDependencyRead(ownerState, targetState.id, callExpression, "recoil:get", "recoil:get", dependencyEdges, usageEvents);
+        continue;
+      }
+
+      if (isJotaiStoreGetCall(callExpression, jotaiStoreSymbolKeys)) {
+        pushDependencyRead(ownerState, targetState.id, callExpression, "jotai:get", "jotai:store.get", dependencyEdges, usageEvents);
+      }
+    }
+  }
+}
+
+function pushDependencyRead(
+  ownerState: StateSymbol,
+  targetStateId: string,
+  callExpression: CallExpression,
+  edgeVia: DependencyEdge["via"],
+  eventVia: string,
+  dependencyEdges: DependencyEdge[],
+  usageEvents: UsageEvent[],
+): void {
+  const location = getLocation(callExpression);
+
+  dependencyEdges.push({
+    fromStateId: ownerState.id,
+    toStateId: targetStateId,
+    filePath: callExpression.getSourceFile().getFilePath(),
+    line: location.line,
+    column: location.column,
+    via: edgeVia,
+  });
+
+  usageEvents.push({
+    type: "read",
+    phase: "dependency",
+    stateId: targetStateId,
+    actorType: "state",
+    actorName: ownerState.name,
+    actorStateId: ownerState.id,
+    filePath: callExpression.getSourceFile().getFilePath(),
+    line: location.line,
+    column: location.column,
+    via: eventVia,
+  });
+}
+
+function getRecoilAtomDefaultSelectorCall(
+  atomCallExpression: CallExpression,
+  index: SymbolIndex,
+): CallExpression | undefined {
+  const optionsArg = atomCallExpression.getArguments()[0];
+  if (!optionsArg || !Node.isObjectLiteralExpression(optionsArg)) {
+    return undefined;
+  }
+
+  const defaultProperty = optionsArg
+    .getProperties()
+    .find((property) => Node.isPropertyAssignment(property) && property.getName() === "default");
+
+  if (!defaultProperty || !Node.isPropertyAssignment(defaultProperty)) {
+    return undefined;
+  }
+
+  const initializer = defaultProperty.getInitializer();
+  if (!initializer) {
+    return undefined;
+  }
+
+  if (Node.isCallExpression(initializer) && isRecoilSelectorFactoryCall(initializer, index)) {
+    return initializer;
+  }
+
+  const referencedState = resolveStateFromExpression(initializer, index);
+  if (
+    !referencedState ||
+    referencedState.store !== "recoil" ||
+    (referencedState.kind !== "selector" && referencedState.kind !== "selectorFamily")
+  ) {
+    return undefined;
+  }
+
+  return index.initCallByStateId.get(referencedState.id);
+}
+
+function isRecoilSelectorFactoryCall(callExpression: CallExpression, index: SymbolIndex): boolean {
+  const importMap = index.importMapByFilePath.get(callExpression.getSourceFile().getFilePath());
+  if (!importMap) {
+    return false;
+  }
+
+  const factory = resolveCalledFactory(callExpression, importMap);
+  if (!factory || factory.module !== "recoil") {
+    return false;
+  }
+
+  return factory.imported === "selector" || factory.imported === "selectorFamily";
+}
+
+function getRecoilReadScopes(callExpression: CallExpression): RecoilReadScope[] {
+  const optionsArg = callExpression.getArguments()[0];
+  if (!optionsArg || !Node.isObjectLiteralExpression(optionsArg)) {
+    return [];
+  }
+
+  const getProperty = optionsArg
+    .getProperties()
+    .find((property) =>
+      (Node.isPropertyAssignment(property) || Node.isMethodDeclaration(property)) &&
+      property.getName() === "get",
+    );
+
+  if (!getProperty) {
+    return [];
+  }
+
+  const rootFunctions: FunctionLikeNode[] = [];
+  if (Node.isMethodDeclaration(getProperty)) {
+    rootFunctions.push(getProperty);
+  }
+
+  if (Node.isPropertyAssignment(getProperty)) {
+    const initializer = getProperty.getInitializer();
+    if (initializer && (Node.isArrowFunction(initializer) || Node.isFunctionExpression(initializer))) {
+      rootFunctions.push(initializer);
+    }
+  }
+
+  const scopes: RecoilReadScope[] = [];
+  for (const rootFunction of rootFunctions) {
+    for (const functionNode of getNestedFunctionNodes(rootFunction)) {
+      const binding = extractRecoilGetBinding(functionNode);
+      if (!binding) {
+        if (functionNode === rootFunction) {
+          scopes.push({
+            scopeNode: functionNode,
+            getNames: new Set<string>(),
+            contextNames: new Set<string>(),
+          });
+        }
+        continue;
+      }
+
+      scopes.push({
+        scopeNode: functionNode,
+        getNames: binding.getNames,
+        contextNames: binding.contextNames,
+      });
+    }
+  }
+
+  return scopes;
+}
+
+function getNestedFunctionNodes(rootFunction: FunctionLikeNode): FunctionLikeNode[] {
+  const nodes: FunctionLikeNode[] = [rootFunction];
+  for (const descendant of rootFunction.getDescendants()) {
+    if (isFunctionLikeNode(descendant)) {
+      nodes.push(descendant);
+    }
+  }
+  return nodes;
+}
+
+function extractRecoilGetBinding(
+  functionNode: FunctionLikeNode,
+): { getNames: Set<string>; contextNames: Set<string> } | undefined {
+  const getNames = new Set<string>();
+  const contextNames = new Set<string>();
+
+  const firstParameter = functionNode.getParameters()[0];
+  if (!firstParameter) {
+    return undefined;
+  }
+
+  const parameterNameNode = firstParameter.getNameNode();
+  if (Node.isIdentifier(parameterNameNode)) {
+    contextNames.add(parameterNameNode.getText());
+  }
+
+  if (Node.isObjectBindingPattern(parameterNameNode)) {
+    for (const element of parameterNameNode.getElements()) {
+      const propertyName = element.getPropertyNameNode()?.getText() ?? element.getName();
+      if (propertyName !== "get") {
+        continue;
+      }
+
+      collectIdentifiersFromBindingName(element.getNameNode(), getNames);
+    }
+  }
+
+  if (getNames.size === 0 && contextNames.size === 0) {
+    return undefined;
+  }
+
+  return {
+    getNames,
+    contextNames,
+  };
+}
+
+function isJotaiStoreGetCall(callExpression: CallExpression, jotaiStoreSymbolKeys: Set<string>): boolean {
+  const callee = callExpression.getExpression();
+  if (!Node.isPropertyAccessExpression(callee) || callee.getName() !== "get") {
+    return false;
+  }
+
+  const base = callee.getExpression();
+  if (!Node.isIdentifier(base)) {
+    return false;
+  }
+
+  return isKnownJotaiStoreIdentifier(base, jotaiStoreSymbolKeys);
+}
+
+function isJotaiStoreSetCall(callExpression: CallExpression, jotaiStoreSymbolKeys: Set<string>): boolean {
+  const callee = callExpression.getExpression();
+  if (!Node.isPropertyAccessExpression(callee) || callee.getName() !== "set") {
+    return false;
+  }
+
+  const base = callee.getExpression();
+  if (!Node.isIdentifier(base)) {
+    return false;
+  }
+
+  return isKnownJotaiStoreIdentifier(base, jotaiStoreSymbolKeys);
+}
+
+function isKnownJotaiStoreIdentifier(identifier: Node, jotaiStoreSymbolKeys: Set<string>): boolean {
+  if (!Node.isIdentifier(identifier)) {
+    return false;
+  }
+
+  const symbolKey = getSymbolKey(identifier);
+  if (symbolKey && jotaiStoreSymbolKeys.has(`sym|${symbolKey}`)) {
+    return true;
+  }
+
+  return jotaiStoreSymbolKeys.has(
+    getFallbackSetterKey(identifier.getSourceFile().getFilePath(), identifier.getText()),
+  );
+}
+
 function classifyRuntimeRead(
   callExpression: CallExpression,
   importMap: ImportMap,
@@ -937,7 +1225,44 @@ function extractSetterReferenceWriteEvents(
   return events;
 }
 
-function classifyDirectMutationWrite(callExpression: CallExpression, index: SymbolIndex): UsageEvent | undefined {
+function classifyJotaiStoreSetWrite(
+  callExpression: CallExpression,
+  jotaiStoreSymbolKeys: Set<string>,
+  index: SymbolIndex,
+): UsageEvent | undefined {
+  if (!isJotaiStoreSetCall(callExpression, jotaiStoreSymbolKeys)) {
+    return undefined;
+  }
+
+  const targetState = resolveStateFromExpression(callExpression.getArguments()[0], index);
+  if (!targetState) {
+    return undefined;
+  }
+
+  const location = getLocation(callExpression);
+  const writeType = classifyWriteType(callExpression);
+  return {
+    type: writeType,
+    phase: "runtime",
+    stateId: targetState.id,
+    actorType: "function",
+    actorName: getContainingFunctionName(callExpression),
+    filePath: callExpression.getSourceFile().getFilePath(),
+    line: location.line,
+    column: location.column,
+    via: writeType === "initWrite" ? "initializeState:jotai:store.set" : "jotai:store.set",
+  };
+}
+
+function classifyDirectMutationWrite(
+  callExpression: CallExpression,
+  jotaiStoreSymbolKeys: Set<string>,
+  index: SymbolIndex,
+): UsageEvent | undefined {
+  if (isJotaiStoreSetCall(callExpression, jotaiStoreSymbolKeys)) {
+    return undefined;
+  }
+
   const mutationKind = resolveMutationKind(callExpression.getExpression());
   if (!mutationKind) {
     return undefined;
@@ -1384,62 +1709,6 @@ function classifyWriteType(node: Node): WriteEventType {
   return isInitWriteContext(node) ? "initWrite" : "runtimeWrite";
 }
 
-function getRecoilReadFunctions(callExpression: CallExpression): Array<ArrowFunction | FunctionExpression> {
-  const optionsArg = callExpression.getArguments()[0];
-  if (!optionsArg || !Node.isObjectLiteralExpression(optionsArg)) {
-    return [];
-  }
-
-  const results: Array<ArrowFunction | FunctionExpression> = [];
-  const getProperty = optionsArg
-    .getProperties()
-    .find((property) =>
-      (Node.isPropertyAssignment(property) || Node.isMethodDeclaration(property)) &&
-      property.getName() === "get",
-    );
-
-  if (!getProperty) {
-    return results;
-  }
-
-  if (Node.isMethodDeclaration(getProperty)) {
-    const body = getProperty.getBody();
-    if (!body) {
-      return results;
-    }
-    return body
-      .getDescendants()
-      .filter((node): node is ArrowFunction | FunctionExpression =>
-        Node.isArrowFunction(node) || Node.isFunctionExpression(node),
-      );
-  }
-
-  if (!Node.isPropertyAssignment(getProperty)) {
-    return results;
-  }
-
-  const initializer = getProperty.getInitializer();
-  if (!initializer) {
-    return results;
-  }
-
-  if (Node.isArrowFunction(initializer) || Node.isFunctionExpression(initializer)) {
-    results.push(initializer);
-
-    for (const nested of initializer
-      .getDescendants()
-      .filter((node): node is ArrowFunction | FunctionExpression =>
-        Node.isArrowFunction(node) || Node.isFunctionExpression(node),
-      )) {
-      if (nested !== initializer) {
-        results.push(nested);
-      }
-    }
-  }
-
-  return results;
-}
-
 function getJotaiReadFunction(callExpression: CallExpression): ArrowFunction | FunctionExpression | undefined {
   const firstArg = callExpression.getArguments()[0];
   if (!firstArg) {
@@ -1468,13 +1737,22 @@ function getParameterNameOrDefault(
   return fallbackName;
 }
 
-function isRecoilGetCall(callExpression: CallExpression): boolean {
+function isRecoilGetCall(
+  callExpression: CallExpression,
+  getNames: Set<string>,
+  contextNames: Set<string>,
+): boolean {
   const callee = callExpression.getExpression();
   if (Node.isIdentifier(callee)) {
-    return callee.getText() === "get";
+    return getNames.has(callee.getText());
   }
   if (Node.isPropertyAccessExpression(callee)) {
-    return callee.getName() === "get";
+    if (callee.getName() !== "get") {
+      return false;
+    }
+
+    const base = callee.getExpression();
+    return Node.isIdentifier(base) && contextNames.has(base.getText());
   }
   return false;
 }

@@ -1,0 +1,12 @@
+{
+  "ok": false,
+  "summary": {
+    "violations": 1
+  },
+  "violations": [
+    {
+      "rule": "R001",
+      "state": "illegalSelectorMethod"
+    }
+  ]
+}
