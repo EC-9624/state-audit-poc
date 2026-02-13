@@ -5,6 +5,8 @@ import {
   collectIdentifiersFromBindingName,
   getFallbackSetterKey,
   getLocation,
+  isInFunctionOwnScope,
+  resolveFunctionLikeNodesFromExpression,
   getSymbolKey,
   isFunctionLikeNode,
   type FunctionLikeNode,
@@ -32,7 +34,10 @@ export function buildDependencyEvents(
       collectRecoilDependencyReads(ownerState.id, ownerState.name, readScopes, jotaiStoreSymbolKeys, index, dependencyEdges, usageEvents);
     }
 
-    if (ownerState.store === "recoil" && ownerState.kind === "atom" && !ownerState.isRecoilPlainAtom) {
+    const isRecoilDefaultSelectorOwner =
+      ownerState.store === "recoil" &&
+      (ownerState.kind === "atomFamily" || (ownerState.kind === "atom" && !ownerState.isRecoilPlainAtom));
+    if (isRecoilDefaultSelectorOwner) {
       const initCall = index.initCallByStateId.get(ownerState.id);
       if (!initCall) continue;
 
@@ -50,13 +55,16 @@ export function buildDependencyEvents(
       const readFunction = getJotaiReadFunction(initCall);
       if (!readFunction) continue;
 
-      const getParamName = getJotaiGetParameterName(readFunction);
-      for (const getCall of readFunction.getDescendantsOfKind(SyntaxKind.CallExpression)) {
-        if (!isJotaiGetCall(getCall, getParamName)) continue;
-        const targetState = resolveStateFromExpression(getCall.getArguments()[0], index);
-        if (!targetState) continue;
+      collectJotaiDependencyReads(ownerState.id, ownerState.name, readFunction, index, dependencyEdges, usageEvents);
+    }
 
-        pushDependencyRead(ownerState.id, ownerState.name, targetState.id, getCall, "jotai:get", "jotai:get", dependencyEdges, usageEvents);
+    if (ownerState.store === "jotai" && ownerState.kind === "atomFamily") {
+      const initCall = index.initCallByStateId.get(ownerState.id);
+      if (!initCall) continue;
+
+      const readFunctions = getJotaiAtomFamilyReadFunctions(initCall, index);
+      for (const readFunction of readFunctions) {
+        collectJotaiDependencyReads(ownerState.id, ownerState.name, readFunction, index, dependencyEdges, usageEvents);
       }
     }
   }
@@ -103,6 +111,24 @@ function collectRecoilDependencyReads(
         pushDependencyRead(ownerStateId, ownerStateName, targetState.id, callExpression, "jotai:get", "jotai:store.get", dependencyEdges, usageEvents);
       }
     }
+  }
+}
+
+function collectJotaiDependencyReads(
+  ownerStateId: string,
+  ownerStateName: string,
+  readFunction: Expression,
+  index: SymbolIndex,
+  dependencyEdges: DependencyEdge[],
+  usageEvents: UsageEvent[],
+): void {
+  const getParamName = getJotaiGetParameterName(readFunction);
+  for (const getCall of readFunction.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+    if (!isJotaiGetCall(getCall, getParamName)) continue;
+    const targetState = resolveStateFromExpression(getCall.getArguments()[0], index);
+    if (!targetState) continue;
+
+    pushDependencyRead(ownerStateId, ownerStateName, targetState.id, getCall, "jotai:get", "jotai:get", dependencyEdges, usageEvents);
   }
 }
 
@@ -231,6 +257,86 @@ function getJotaiReadFunction(callExpression: CallExpression): Expression | unde
   if (!firstArg) return undefined;
   if (Node.isArrowFunction(firstArg) || Node.isFunctionExpression(firstArg)) return firstArg;
   return undefined;
+}
+
+function getJotaiAtomFamilyReadFunctions(atomFamilyCall: CallExpression, index: SymbolIndex): Expression[] {
+  const familyFactoryArg = atomFamilyCall.getArguments()[0];
+  const familyFactoryFunctions = resolveFunctionNodesFromExpression(familyFactoryArg);
+  if (familyFactoryFunctions.length === 0) return [];
+
+  const readFunctions: Expression[] = [];
+  for (const familyFactoryFunction of familyFactoryFunctions) {
+    for (const returnedCallExpression of getReturnedCallExpressions(familyFactoryFunction)) {
+      if (!isJotaiDerivedFactoryCall(returnedCallExpression, index)) {
+        continue;
+      }
+      const readFunction = getJotaiReadFunction(returnedCallExpression);
+      if (readFunction) {
+        readFunctions.push(readFunction);
+      }
+    }
+  }
+
+  return readFunctions;
+}
+
+function resolveFunctionNodesFromExpression(expression: Node | undefined): FunctionLikeNode[] {
+  if (!expression) return [];
+
+  if (
+    Node.isArrowFunction(expression) ||
+    Node.isFunctionExpression(expression) ||
+    Node.isFunctionDeclaration(expression) ||
+    Node.isMethodDeclaration(expression)
+  ) {
+    return [expression];
+  }
+
+  return resolveFunctionLikeNodesFromExpression(expression);
+}
+
+function getReturnedCallExpressions(functionNode: FunctionLikeNode): CallExpression[] {
+  if ((Node.isArrowFunction(functionNode) || Node.isFunctionExpression(functionNode)) && !Node.isBlock(functionNode.getBody())) {
+    const bodyExpression = functionNode.getBody();
+    return Node.isCallExpression(bodyExpression) ? [bodyExpression] : [];
+  }
+
+  const body =
+    Node.isFunctionDeclaration(functionNode) ||
+    Node.isMethodDeclaration(functionNode) ||
+    Node.isArrowFunction(functionNode) ||
+    Node.isFunctionExpression(functionNode)
+      ? functionNode.getBody()
+      : undefined;
+  if (!body || !Node.isBlock(body)) {
+    return [];
+  }
+
+  const calls: CallExpression[] = [];
+  for (const returnStatement of body.getDescendantsOfKind(SyntaxKind.ReturnStatement)) {
+    if (!isInFunctionOwnScope(returnStatement, functionNode)) {
+      continue;
+    }
+    const expression = returnStatement.getExpression();
+    if (expression && Node.isCallExpression(expression)) {
+      calls.push(expression);
+    }
+  }
+
+  return calls;
+}
+
+function isJotaiDerivedFactoryCall(callExpression: CallExpression, index: SymbolIndex): boolean {
+  const importMap = index.importMapByFilePath.get(callExpression.getSourceFile().getFilePath());
+  if (!importMap) return false;
+
+  const factory = resolveCalledFactory(callExpression, importMap);
+  if (!factory) return false;
+
+  return (
+    (factory.module === "jotai" && factory.imported === "atom") ||
+    (factory.module === "jotai/utils" && factory.imported === "atomWithDefault")
+  );
 }
 
 function getJotaiGetParameterName(functionNode: Expression): string {
