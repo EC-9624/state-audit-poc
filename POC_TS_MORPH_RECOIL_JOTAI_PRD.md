@@ -1,8 +1,20 @@
 # PRD: Standalone POC for Recoil/Jotai Migration Analyzer (ts-morph)
 
-Status: Draft
+Status: Implemented (v0.1.0 POC snapshot)
 
 Owner: State Migration Working Group
+
+## 0) Current Implementation Snapshot
+
+This PRD started as a build spec and now also tracks implemented state.
+
+Current snapshot:
+
+- Rule engine implemented for `R001`-`R004`.
+- Impact analysis implemented for `--state` and `--file` query modes.
+- Profile system implemented (`core`, `extended`) with capability flags.
+- Fixture harness implemented with semantic subset matching (`C01`-`C18`).
+- CLI commands available: `state:audit`, `state:impact`, `fixtures:run`, `typecheck`.
 
 ## 1) Purpose
 
@@ -132,7 +144,7 @@ Analyzer pipeline:
 
 ## 11.1 `state:audit`
 
-Command (POC):
+Command:
 
 ```bash
 pnpm state:audit --root ./fixtures/C04_R004_stale_recoil_runtime_readonly/src
@@ -141,7 +153,8 @@ pnpm state:audit --root ./fixtures/C04_R004_stale_recoil_runtime_readonly/src
 Options:
 
 - `--root <path>`
-- `--tsconfig <path>`
+- `--tsconfig <path>` (optional; auto-detects nearest `tsconfig.json` from `--root` when omitted)
+- `--profile core|extended` (default: `extended`)
 - `--format text|json` (default: `text`)
 - `--include <glob>` (optional)
 - `--exclude <glob>` (optional)
@@ -154,7 +167,7 @@ Exit codes:
 
 ## 11.2 `state:impact`
 
-Command (POC):
+Command:
 
 ```bash
 pnpm state:impact --root ./fixtures/C05_PASS_valid_mixed_migration/src --state counterState
@@ -167,29 +180,56 @@ Query modes (exactly one):
 
 Options:
 
+- `--root <path>`
+- `--tsconfig <path>` (optional; auto-detects nearest `tsconfig.json` from `--root` when omitted)
+- `--profile core|extended` (default: `extended`)
+- `--include <glob>` (optional)
+- `--exclude <glob>` (optional)
 - `--depth <n>`
 - `--format text|json`
 
-## 12) Recommended POC Project Structure
+Exit codes:
+
+- `0`: success
+- `2`: tool/runtime/config error
+
+## 12) Implemented POC Project Structure
 
 ```text
 state-audit-poc/
   package.json
   tsconfig.json
   README.md
+  POC_TS_MORPH_RECOIL_JOTAI_PRD.md
+  docs/
+    analyzer-architecture.md
   src/
     cli/
       state-audit.ts
       state-impact.ts
       run-fixtures.ts
     core/
-      types.ts
-      config.ts
-      project.ts
-      symbols.ts
-      events.ts
       analyzer.ts
+      config.ts
+      events.ts
+      impact.ts
+      profiles.ts
+      project.ts
       reporter.ts
+      symbols.ts
+      types.ts
+      events/
+        pipeline.ts
+        types.ts
+        shared/common.ts
+        core/
+          direct-hooks.ts
+          dependencies.ts
+          setter-bindings.ts
+        extensions/
+          callbacks/index.ts
+          forwarding/index.ts
+          store-api/index.ts
       rules/
         r001-recoil-selector-reads-jotai.ts
         r002-jotai-derived-reads-recoil.ts
@@ -197,41 +237,23 @@ state-audit-poc/
         r004-stale-readonly-recoil-atom.ts
   fixtures/
     C01_R001_recoil_selector_reads_jotai/
-      src/
-        jotai-state.ts
-        recoil-state.ts
-      expected.json
     C02_R002_jotai_derived_reads_recoil/
-      src/
-        recoil-state.ts
-        jotai-state.ts
-      expected.json
     C03_R003_dead_recoil_state/
-      src/
-        dead-state.ts
-      expected.json
     C04_R004_stale_recoil_runtime_readonly/
-      src/
-        state.ts
-        reader.tsx
-        root.tsx
-      expected.json
     C05_PASS_valid_mixed_migration/
-      src/
-        recoil-state.ts
-        jotai-state.ts
-        consumer.tsx
-      expected.json
     C06_PASS_recoil_atom_selector_default_exempt/
-      src/
-        states.ts
-      expected.json
     C07_R003_test_story_refs_ignored/
-      src/
-        state.ts
-        state.test.tsx
-        state.stories.tsx
-      expected.json
+    C08_PASS_recoil_callback_alias_set_write/
+    C09_PASS_recoil_callback_reset_write/
+    C10_R004_init_helper_write_excluded/
+    C11_PASS_use_reset_recoil_state_call/
+    C12_R004_snapshot_get_promise_readonly/
+    C13_PASS_wrapper_use_set_recoil_state/
+    C14_PASS_object_wrapper_state_hook/
+    C15_PASS_one_hop_prop_forwarding/
+    C16_PASS_one_hop_function_arg_forwarding/
+    C17_R001_selector_method_get_reads_jotai/
+    C18_R001_selector_store_get_reads_jotai/
 ```
 
 ## 13) Fixture Expectations
@@ -243,6 +265,17 @@ state-audit-poc/
 - C05 -> pass
 - C06 -> pass (selector-default exemption from R004)
 - C07 -> `R003` fail (test/story references ignored)
+- C08 -> pass (callback alias set write recognized)
+- C09 -> pass (callback reset write recognized)
+- C10 -> `R004` fail (init-only helper writes do not count as runtime writes)
+- C11 -> pass (`useResetRecoilState` write recognized)
+- C12 -> `R004` fail (`snapshot.getPromise` read without runtime write)
+- C13 -> pass (wrapper hook around `useSetRecoilState` recognized)
+- C14 -> pass (object-returning wrapper state hook recognized)
+- C15 -> pass (one-hop prop forwarding recognized)
+- C16 -> pass (one-hop function-argument forwarding recognized)
+- C17 -> `R001` fail (selector method-form `get` reads Jotai)
+- C18 -> `R001` fail (selector `store.get` reads Jotai)
 
 ## 14) Output Schema (JSON)
 
@@ -271,12 +304,12 @@ state-audit-poc/
 
 ## 15) Milestones
 
-1. Implement symbol extraction.
-2. Implement usage event classification.
-3. Implement R001-R004.
-4. Implement fixture runner and expected-result validator.
-5. Implement impact command.
-6. Produce final POC report with pass/fail table.
+- [x] Implement symbol extraction.
+- [x] Implement usage event classification.
+- [x] Implement `R001`-`R004`.
+- [x] Implement fixture runner and expected-result validator.
+- [x] Implement impact command.
+- [x] Document architecture and usage (`README.md`, `docs/analyzer-architecture.md`).
 
 ## 16) Risks and Mitigations
 
@@ -296,14 +329,14 @@ Mitigation:
 
 ## 17) Deliverables
 
-- Standalone runnable POC project
-- Fixture matrix with expected outputs
-- One POC report summarizing:
-  - rule accuracy
-  - false positives/negatives
-  - impact output quality
+- Standalone runnable POC project (`state:audit`, `state:impact`, `fixtures:run`).
+- Fixture matrix with expected outputs (`C01`-`C18`).
+- Architecture and usage documentation:
+  - `README.md`
+  - `docs/analyzer-architecture.md`
+  - this PRD (status-tracking snapshot)
 
-## 18) AI Agent Handoff Prompt
+## 18) Historical AI Agent Handoff Prompt
 
 Use this exact task prompt for implementation agents:
 

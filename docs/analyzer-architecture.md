@@ -1,230 +1,198 @@
-# Analyzer Architecture and Pattern Inventory
+# Analyzer Architecture (Current State)
 
-This document explains why the analyzer is larger than a simple `ts-morph` AST walk, how the code is structured now, and what Recoil/Jotai read-write patterns appear in `press-release-editor-v3`.
+This document describes the implemented architecture in `state-audit-poc` as of the current `main` branch.
 
-## Why This Is Not a "Simple Walk"
+## Overview
 
-At a high level, a simple walk can only answer:
+The analyzer is a deterministic static-analysis pipeline for mixed Recoil/Jotai codebases. It does two jobs:
 
-- "Find calls to `useRecoilValue(...)`"
-- "Find definitions of `atom(...)`"
+1. `state:audit` - detect migration rule violations (`R001`-`R004`).
+2. `state:impact` - report direct readers/writers plus transitive dependents.
 
-This analyzer must answer harder questions:
+The design is intentionally split into focused modules so new extraction logic can be added without rewriting rule logic.
 
-1. **Wrapper resolution**
-   - Detect writes through custom hooks (for example, `useSetXxxState()` that wraps `useSetRecoilState(...)`).
-2. **Forwarding resolution (one hop)**
-   - Detect when setter functions are passed as function args or JSX props and called in the callee.
-3. **Callback semantics**
-   - Detect reads/writes inside `useRecoilCallback` and `useAtomCallback`.
-4. **Dependency graph extraction**
-   - Build state-to-state edges from selector/derived `get(...)` reads (including method syntax and atom defaults).
-5. **Runtime vs init write classification**
-   - Separate `runtimeWrite` and `initWrite` for R004 correctness.
+## End-to-End Flow
 
-Those capabilities are what add code volume.
-
-## Profiles
-
-The analyzer supports two profiles that control which capabilities are enabled:
-
-| Profile          | CLI default? | Capabilities enabled                       |
-|------------------|-------------|---------------------------------------------|
-| `extended`       | Yes         | All (callbacks, wrappers, forwarding, storeApi) |
-| `core`           | No          | None — direct hooks and dependencies only   |
-
-Defined in `src/core/profiles.ts`. The `extended` profile is the default to preserve backward compatibility and full accuracy. The `core` profile provides a simpler, faster analysis that only detects direct Recoil/Jotai hook calls and selector dependency edges.
-
-**Profile impact on real codebase** (`press-release-editor-v3`, using app tsconfig resolution):
-- `extended`: 7 violations (1 R001, 1 R003, 5 R004)
-- `core`: 29 violations (0 R001, 1 R003, 28 R004)
-
-Interpretation of the delta:
-- `core` misses 1 R001 cross-store dependency (store-api capability disabled)
-- `core` reports 23 additional R004 issues that `extended` resolves via wrappers/callbacks/forwarding support
-
-To reproduce these numbers, run from `state-audit-poc` with:
-
-```bash
-ROOT="/Users/eakudompong.chanoknan/prtimes-dev-docker/prtimes-frontend/src/apps/prtimes/src/features/press-release-editor-v3"
-pnpm state:audit --root "$ROOT" --profile extended --format json
-pnpm state:audit --root "$ROOT" --profile core --format json
+```text
+CLI (state:audit | state:impact)
+  -> parse CLI args + build AnalyzerConfig
+  -> load ts-morph Project + in-scope source files
+  -> build state symbol index
+  -> build usage events + dependency edges
+  -> (audit) build reference index + evaluate R001-R004
+  -> (impact) resolve targets + collect direct/indirect impact
+  -> render text/json output
 ```
 
-The CLI now auto-detects nearest `tsconfig.json` from `--root`; this is important for monorepo path alias resolution and directly affects writer detection accuracy.
+Core orchestration entry points:
 
-### Capability Flags
+- `src/core/analyzer.ts` (`createAnalyzerContext`, `runAudit`)
+- `src/core/impact.ts` (`runImpact`)
+- `src/core/reporter.ts` (text/json rendering)
+
+## Why This Is More Than an AST Walk
+
+A simple syntax walk can find direct hook calls, but this analyzer must also model:
+
+- wrapper hooks that hide setters
+- one-hop setter forwarding via function arguments and JSX props
+- callback semantics in `useRecoilCallback` and `useAtomCallback`
+- dependency edges from selector/derived `get(...)` reads
+- runtime vs init write classification for `R004`
+
+Those behaviors drive most complexity in `src/core/events/`.
+
+## Profiles and Capability Flags
+
+Profiles are defined in `src/core/profiles.ts`.
+
+| Profile | Default | callbacks | wrappers | forwarding | storeApi |
+| --- | --- | --- | --- | --- | --- |
+| `extended` | yes | on | on | on | on |
+| `core` | no | off | off | off | off |
+
+Capability flags shape:
 
 ```typescript
 interface CapabilityFlags {
-  callbacks: boolean;   // useRecoilCallback / useAtomCallback extraction
-  wrappers: boolean;    // alias-aware wrapper hook resolution
-  forwarding: boolean;  // one-hop setter propagation via args/props
-  storeApi: boolean;    // Jotai createStore / store.get / store.set
+  callbacks: boolean;
+  wrappers: boolean;
+  forwarding: boolean;
+  storeApi: boolean;
 }
 ```
 
-## Module Layout (Core + Extensions)
+## Module Layout
 
-The `events` logic is organized into three layers:
-
-```
-src/core/events/
-├── types.ts                          # EventExtractor interface, EventPipelineContext
-├── pipeline.ts                       # Registry-based orchestrator with capability gates
-├── shared/
-│   └── common.ts                     # Shared helpers, constants, event constructors, dedupe/sort
-├── core/                             # Always-on extractors (no capability gate)
-│   ├── index.ts                      # Barrel export
-│   ├── direct-hooks.ts               # Runtime read/write classifiers for direct hook calls
-│   ├── dependencies.ts               # Selector/derived get(...) dependency edge extraction
-│   └── setter-bindings.ts            # Direct + wrapper-aware setter binding resolution
-└── extensions/                       # Gated by CapabilityFlags
-    ├── callbacks/
-    │   └── index.ts                  # useRecoilCallback + useAtomCallback extraction
-    ├── forwarding/
-    │   └── index.ts                  # One-hop arg/prop setter propagation
-    └── store-api/
-        └── index.ts                  # Jotai createStore / store.get / store.set
-```
-
-Supporting modules outside `events/`:
-
-- `src/core/profiles.ts` — profile definitions + capability flag resolution
-- `src/core/config.ts` — resolves CLI config (profile/capabilities, include/exclude, nearest tsconfig discovery)
-- `src/core/events.ts` — thin re-export of `buildUsageEvents` (public entry point, unchanged)
-
-### Core Extractors (always active)
-
-| Module | Extractor ID | What it does |
-|--------|-------------|--------------|
-| `core/direct-hooks.ts` | `core:direct-hooks` | Classifies `useRecoilValue`, `useSetRecoilState`, `useAtomValue`, `useSetAtom`, etc. as read/runtimeWrite/initWrite events |
-| `core/dependencies.ts` | `core:dependencies` | Extracts state-to-state dependency edges from selector `get(...)`, derived atoms, and atom default selectors |
-| `core/setter-bindings.ts` | (utility, not an extractor) | Builds `Map<localVar, symbolKey>` for setter resolution; exports both `buildDirectSetterBindings` (core) and `buildSetterBindings` (wrapper-aware) |
-
-### Extension Extractors (gated by capabilities)
-
-| Module | Extractor ID | Capability gate | What it does |
-|--------|-------------|----------------|--------------|
-| `extensions/callbacks/` | `ext:callbacks` | `callbacks` | Extracts read/write events from `useRecoilCallback` and `useAtomCallback` bodies |
-| `extensions/store-api/` | `ext:store-api` | `storeApi` | Detects `store.get(...)` / `store.set(...)` from Jotai `createStore()` |
-| `extensions/forwarding/` | (utility, not an extractor) | `forwarding` | Runs `propagateSetterBindingsOneHop` to extend setter bindings through function args and JSX props |
-
-Note: `wrappers` and `forwarding` are not standalone `EventExtractor` implementations. They are toggles in the pipeline's binding-build phase:
-- **wrappers**: `buildSetterBindings` (wrapper-aware) vs `buildDirectSetterBindings` (direct only)
-- **forwarding**: `propagateSetterBindingsOneHop` applied after binding resolution
-
-## Event Pipeline (Data Flow)
-
-```
-buildUsageEvents(sourceFiles, index, config)
-│
-├─ Phase 1: Build shared bindings
-│   ├─ [storeApi?]  buildJotaiStoreSymbolKeys()
-│   ├─ [wrappers?]  buildSetterBindings() vs buildDirectSetterBindings()
-│   └─ [forwarding?] propagateSetterBindingsOneHop()
-│
-├─ Phase 2: Build pipeline context (EventPipelineContext)
-│
-├─ Phase 3: Assemble extractors
-│   ├─ always:      coreDirectHooksExtractor, coreDependenciesExtractor
-│   ├─ [callbacks?] callbacksExtractor
-│   └─ [storeApi?]  storeApiExtractor
-│
-├─ Phase 4: Run all extractors → collect usageEvents + dependencyEdges
-│
-└─ Phase 5: Dedupe + sort → return EventExtractionResult
+```text
+src/core/
+  config.ts                    # CLI parsing + config + scope filters
+  profiles.ts                  # profile and capability flag resolution
+  project.ts                   # ts-morph project loading
+  symbols.ts                   # state symbol extraction/index
+  analyzer.ts                  # audit context + rule orchestration
+  impact.ts                    # impact report generation
+  reporter.ts                  # text/json renderers
+  rules/
+    r001-recoil-selector-reads-jotai.ts
+    r002-jotai-derived-reads-recoil.ts
+    r003-dead-recoil-state.ts
+    r004-stale-readonly-recoil-atom.ts
+  events/
+    pipeline.ts                # phase-based orchestrator
+    types.ts                   # EventExtractor + EventPipelineContext
+    shared/common.ts           # helpers + constructors + dedupe/sort
+    core/
+      direct-hooks.ts          # direct read/write extraction
+      dependencies.ts          # dependency edge extraction
+      setter-bindings.ts       # direct + wrapper-aware binding resolution
+    extensions/
+      callbacks/index.ts       # callback body extraction
+      forwarding/index.ts      # one-hop setter propagation
+      store-api/index.ts       # createStore/store.get/store.set extraction
 ```
 
-Outputs:
+## Event Pipeline Internals
 
-- `usageEvents` — read/runtimeWrite/initWrite events (consumed by rules R001-R004)
-- `dependencyEdges` — state-to-state edges (consumed by `state:impact` transitive traversal)
+Pipeline function: `buildUsageEvents` in `src/core/events/pipeline.ts`.
 
-## Why LOC Is Concentrated in `events/*`
+```text
+Phase 1: Build shared bindings
+  - [storeApi] buildJotaiStoreSymbolKeys
+  - [wrappers] buildSetterBindings vs buildDirectSetterBindings
+  - [forwarding] propagateSetterBindingsOneHop
 
-`events/*` is effectively a mini static-analysis engine:
+Phase 2: Build EventPipelineContext
 
-- it models control/data flow patterns, not just syntax
-- it normalizes multiple API forms into one internal event model
-- it supports both Recoil and Jotai while migration is mixed
+Phase 3: Assemble extractors
+  - always: coreDirectHooksExtractor, coreDependenciesExtractor
+  - [callbacks]: callbacksExtractor
+  - [storeApi]: storeApiExtractor
 
-This is why complexity is high even though the tool is still a POC.
+Phase 4: Run extractors and collect outputs
 
-## Recoil/Jotai Pattern Inventory: `press-release-editor-v3`
+Phase 5: Dedupe + sort outputs for deterministic results
+```
 
-Source analyzed:
+Pipeline outputs:
 
-- root: `/Users/eakudompong.chanoknan/prtimes-dev-docker/prtimes-frontend/src/apps/prtimes/src/features/press-release-editor-v3`
-- scope for counts below: `*.ts` + `*.tsx`
-- "production_scope" here excludes `*.test.*`, `*.spec.*`, `*.stories.*`
-- `*.test-setup.*` is intentionally kept in scope for now
+- `usageEvents`: `read`, `runtimeWrite`, `initWrite`
+- `dependencyEdges`: `fromStateId -> toStateId` edges
 
-## Distinct pattern families observed (production_scope)
+## Rule Evaluation Model
 
-- Recoil read patterns: **6**
-- Recoil write patterns: **5**
-- Jotai read patterns: **5**
-- Jotai write patterns: **4**
-- Wrapper-heavy usage patterns: **2**
+Rules are pure evaluators over `RuleContext` in `src/core/analyzer.ts`.
 
-## Pattern counts (production_scope)
+- `R001`: Recoil selector/selectorFamily reads Jotai state.
+- `R002`: Jotai derived atom/atomWithDefault reads Recoil state.
+- `R003`: exported Recoil atom/selector has no non-ignored references.
+- `R004`: plain Recoil atom has runtime reads but zero runtime writes.
 
-Recoil read-side indicators:
+`R004` reports metrics (`runtimeReads`, `runtimeWrites`, `initWrites`) and excludes init writes from runtime-write validity.
 
-- `useRecoilValue(...)`: **162**
-- `useRecoilState(...)` (read+write hook): **24**
-- selector `get({get}) { ... }` method form: **26**
-- selector `get: ({get}) => ...` arrow form: **1**
-- `snapshot.getPromise(...)`: **14**
-- `useRecoilCallback(...)` callsites: **31**
+## Impact Analysis Model
 
-Recoil write-side indicators:
+`runImpact` in `src/core/impact.ts`:
 
-- `useSetRecoilState(...)`: **46**
-- `useRecoilState(...)` (setter side implied): **24**
-- `useResetRecoilState(...)`: **2**
-- `initializeState=` usage: **4**
-- callback mutation context via `useRecoilCallback(...)`: **31** (same callsite count as above)
+1. Reuses shared analyzer context (symbols/events/dependencies).
+2. Resolves targets by `--state` exact name match or `--file` path match.
+3. Collects direct readers/writers from `usageEvents`.
+4. Computes transitive dependents with BFS on the reverse dependency graph.
+5. Returns sorted, deterministic report items.
 
-Jotai read-side indicators:
+Depth control (`--depth`) caps BFS traversal.
 
-- `useAtomValue(...)`: **102**
-- `useAtom(...)` (read+write hook): **15**
-- derived `atom((get) => ...)` form: **7**
-- `useAtomCallback(...)` (read/write callback context): **5**
-- direct `store.get(...)`: **1**
+## Configuration and Scope Behavior
 
-Jotai write-side indicators:
+Config behavior is implemented in `src/core/config.ts`.
 
-- `useSetAtom(...)`: **11**
-- `useAtom(...)` (setter side implied): **15**
-- `useAtomCallback(...)` (set path): **5**
-- direct `store.set(...)`: **0** in production scope (appears in tests)
+- include default: `**/*.{ts,tsx}`
+- default excludes (always applied):
+  - `**/__tests__/**`
+  - `**/__storybook__/**`
+  - `**/*.test.*`
+  - `**/*.spec.*`
+  - `**/*.stories.*`
+- tsconfig resolution order:
+  1. explicit `--tsconfig`
+  2. nearest `tsconfig.json` walking up from `--root`
+  3. `./tsconfig.json` fallback from current working directory
 
-Wrapper patterns that drive complexity:
+If no tsconfig is found, `src/core/project.ts` uses internal compiler options.
 
-- exported `useSet*` wrapper hooks: **50**
-- tuple usage from custom state hooks (`const [_, setX] = useXState()`): **52**
+## Fixture Validation Harness
 
-## Interpretation
+Fixture runner: `src/cli/run-fixtures.ts`.
 
-This feature is wrapper-heavy and callback-heavy. That is why the analyzer needs:
+For each fixture directory:
 
-- alias-aware wrapper resolution
-- one-hop propagation
-- callback-aware read/write extraction
-- dependency extraction that handles selector method and atom default-selector forms
+1. run audit against `fixtures/<name>/src`
+2. load `fixtures/<name>/expected.json`
+3. compare with semantic subset matching (expected keys/values must exist in actual)
 
-Without those, impact and R004 become noisy or incomplete — as demonstrated by the 23 extra R004 violations in `core` profile vs `extended` profile on `press-release-editor-v3`.
+This keeps fixtures stable while allowing harmless additive fields in analyzer output.
 
-## Practical Maintenance Notes
+## Determinism Guarantees
 
-To keep this maintainable while preserving capability:
+Current implementation enforces deterministic output by:
 
-1. Keep logic split by concern: core extractors in `events/core/`, extensions in `events/extensions/`.
-2. Add fixtures first for every new pattern before changing logic.
-3. Treat `common.ts` event constructors as the single source for event shape.
-4. New extensions should implement the `EventExtractor` interface and be gated by a capability flag in the pipeline.
-5. Keep one-hop propagation boundary explicit (no silent multi-hop expansion).
-6. When adding a new profile, add an entry in `profiles.ts` FLAGS and verify fixture compatibility.
+- sorting source files during project load
+- deduping and sorting usage events/dependency edges
+- sorting rule violations and impact items/sites before rendering
+
+## Current Boundaries
+
+- TS/TSX static analysis only (no runtime execution).
+- One-hop forwarding only (no implicit multi-hop propagation).
+- Rule set is intentionally scoped to `R001`-`R004`.
+- No auto-fix/codemod behavior.
+
+## Extending the Analyzer Safely
+
+Recommended workflow for new patterns:
+
+1. Add or update fixtures first.
+2. Implement extraction change in `events/core` or `events/extensions`.
+3. Gate optional behavior behind capability flags if needed.
+4. Run `pnpm fixtures:run` and `pnpm typecheck`.
+5. Update README and this architecture document.
