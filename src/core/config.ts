@@ -87,13 +87,12 @@ export function createAnalyzerConfig(input: AnalyzerConfigInput): AnalyzerConfig
   const explicitTsconfig = input.tsconfig
     ? path.resolve(process.cwd(), input.tsconfig)
     : undefined;
+  const discoveredTsconfig = findNearestTsconfig(rootDir);
   const fallbackTsconfig = path.resolve(process.cwd(), "tsconfig.json");
 
   const tsconfigPath = explicitTsconfig
     ? ensureFileExists(explicitTsconfig, "tsconfig")
-    : fs.existsSync(fallbackTsconfig)
-      ? fallbackTsconfig
-      : undefined;
+    : discoveredTsconfig ?? (fs.existsSync(fallbackTsconfig) ? fallbackTsconfig : undefined);
 
   const includeGlobs = input.include && input.include.length > 0 ? input.include : ["**/*.{ts,tsx}"];
   const excludeGlobs = [...DEFAULT_EXCLUDE_GLOBS, ...(input.exclude ?? [])];
@@ -152,6 +151,24 @@ function ensureFileExists(filePath: string, label: string): string {
     throw new Error(`${label} not found: ${filePath}`);
   }
   return filePath;
+}
+
+function findNearestTsconfig(startDir: string): string | undefined {
+  let currentDir = path.resolve(startDir);
+
+  while (true) {
+    const candidate = path.join(currentDir, "tsconfig.json");
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+
+    const parentDir = path.dirname(currentDir);
+    if (parentDir === currentDir) {
+      return undefined;
+    }
+
+    currentDir = parentDir;
+  }
 }
 
 function isDescendantPath(parentPath: string, childPath: string): boolean {

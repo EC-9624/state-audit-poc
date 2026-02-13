@@ -35,9 +35,23 @@ The analyzer supports two profiles that control which capabilities are enabled:
 
 Defined in `src/core/profiles.ts`. The `press-release` profile is the default to preserve backward compatibility and full accuracy. The `core` profile provides a simpler, faster analysis that only detects direct Recoil/Jotai hook calls and selector dependency edges.
 
-**Profile impact on real codebase** (`press-release-editor-v3`):
-- `press-release`: 29 violations (1 R001, 1 R003, 27 R004)
-- `core`: 38 violations (0 R001, 1 R003, 37 R004) — 9 extra R004 false positives because wrapper/callback/forwarding detection is disabled
+**Profile impact on real codebase** (`press-release-editor-v3`, using app tsconfig resolution):
+- `press-release`: 7 violations (1 R001, 1 R003, 5 R004)
+- `core`: 29 violations (0 R001, 1 R003, 28 R004)
+
+Interpretation of the delta:
+- `core` misses 1 R001 cross-store dependency (store-api capability disabled)
+- `core` reports 23 additional R004 issues that `press-release` resolves via wrappers/callbacks/forwarding support
+
+To reproduce these numbers, run from `state-audit-poc` with:
+
+```bash
+ROOT="/Users/eakudompong.chanoknan/prtimes-dev-docker/prtimes-frontend/src/apps/prtimes/src/features/press-release-editor-v3"
+pnpm state:audit --root "$ROOT" --profile press-release --format json
+pnpm state:audit --root "$ROOT" --profile core --format json
+```
+
+The CLI now auto-detects nearest `tsconfig.json` from `--root`; this is important for monorepo path alias resolution and directly affects writer detection accuracy.
 
 ### Capability Flags
 
@@ -77,7 +91,7 @@ src/core/events/
 Supporting modules outside `events/`:
 
 - `src/core/profiles.ts` — profile definitions + capability flag resolution
-- `src/core/config.ts` — accepts `profile` CLI input, wires `AnalyzerProfile` + `CapabilityFlags`
+- `src/core/config.ts` — resolves CLI config (profile/capabilities, include/exclude, nearest tsconfig discovery)
 - `src/core/events.ts` — thin re-export of `buildUsageEvents` (public entry point, unchanged)
 
 ### Core Extractors (always active)
@@ -202,7 +216,7 @@ This feature is wrapper-heavy and callback-heavy. That is why the analyzer needs
 - callback-aware read/write extraction
 - dependency extraction that handles selector method and atom default-selector forms
 
-Without those, impact and R004 become noisy or incomplete — as demonstrated by the 9 extra false-positive R004 violations in `core` profile vs `press-release` profile.
+Without those, impact and R004 become noisy or incomplete — as demonstrated by the 23 extra R004 violations in `core` profile vs `press-release` profile on `press-release-editor-v3`.
 
 ## Practical Maintenance Notes
 

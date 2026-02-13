@@ -11,6 +11,14 @@ pnpm state:impact --root ./fixtures/C05_PASS_valid_mixed_migration/src --state c
 pnpm fixtures:run
 ```
 
+Real project example:
+
+```bash
+ROOT="path-to-project"
+pnpm state:audit --root "$ROOT" --profile press-release
+pnpm state:impact --root "$ROOT" --profile press-release --state pressReleaseBodyJsonState --format json
+```
+
 ## CLI
 
 ### `state:audit`
@@ -18,7 +26,8 @@ pnpm fixtures:run
 Options:
 
 - `--root <path>`
-- `--tsconfig <path>`
+- `--tsconfig <path>` (optional; if omitted, auto-detects nearest `tsconfig.json` by walking up from `--root`, then falls back to `./tsconfig.json`)
+- `--profile core|press-release` (default: `press-release`)
 - `--format text|json` (default: `text`)
 - `--include <glob>` (repeatable or comma-separated)
 - `--exclude <glob>` (repeatable or comma-separated)
@@ -39,9 +48,25 @@ Query modes (exactly one):
 Options:
 
 - `--root <path>`
-- `--tsconfig <path>`
+- `--tsconfig <path>` (optional; if omitted, auto-detects nearest `tsconfig.json` by walking up from `--root`, then falls back to `./tsconfig.json`)
+- `--profile core|press-release` (default: `press-release`)
 - `--depth <n>`
 - `--format text|json`
+
+### Tsconfig Resolution
+
+`tsconfig` selection precedence:
+
+1. `--tsconfig <path>` (explicit)
+2. nearest `tsconfig.json` found by walking up from `--root`
+3. `./tsconfig.json` from the current working directory
+
+For monorepos, set `--root` to the target app/feature path so auto-detection picks that app's tsconfig.
+
+### Profiles
+
+- `press-release`: full capability mode (callbacks, wrappers, forwarding, store API)
+- `core`: direct hooks + dependency extraction only
 
 ## Rules
 
