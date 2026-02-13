@@ -34,7 +34,7 @@ export interface AnalyzerContext extends RuleContext {
 export function createAnalyzerContext(config: AnalyzerConfig): AnalyzerContext {
   const { sourceFiles } = loadProject(config);
   const symbolIndex = buildSymbolIndex(sourceFiles);
-  const eventResult = buildUsageEvents(sourceFiles, symbolIndex);
+  const eventResult = buildUsageEvents(sourceFiles, symbolIndex, config);
   const referencesByStateId = buildReferenceIndex(config, symbolIndex.declarationByStateId);
 
   return {

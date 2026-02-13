@@ -16,6 +16,7 @@ function main(): void {
       include: getListArg(args, "include"),
       exclude: getListArg(args, "exclude"),
       format,
+      profile: getSingleArg(args, "profile"),
     });
 
     const report = runAudit(config);

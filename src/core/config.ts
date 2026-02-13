@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { minimatch } from "minimatch";
+import { getCapabilityFlags, resolveProfile, type AnalyzerProfile } from "./profiles";
 import type { AnalyzerConfig, OutputFormat } from "./types";
 
 export const DEFAULT_EXCLUDE_GLOBS = [
@@ -23,6 +24,7 @@ export interface AnalyzerConfigInput {
   include?: string[];
   exclude?: string[];
   format?: OutputFormat;
+  profile?: string;
 }
 
 export function parseCliArgs(argv: string[]): ParsedCliArgs {
@@ -96,6 +98,7 @@ export function createAnalyzerConfig(input: AnalyzerConfigInput): AnalyzerConfig
   const includeGlobs = input.include && input.include.length > 0 ? input.include : ["**/*.{ts,tsx}"];
   const excludeGlobs = [...DEFAULT_EXCLUDE_GLOBS, ...(input.exclude ?? [])];
   const format: OutputFormat = input.format ?? "text";
+  const profile = resolveProfile(input.profile);
 
   return {
     rootDir,
@@ -103,6 +106,8 @@ export function createAnalyzerConfig(input: AnalyzerConfigInput): AnalyzerConfig
     includeGlobs,
     excludeGlobs,
     format,
+    profile,
+    capabilities: getCapabilityFlags(profile),
   };
 }
 

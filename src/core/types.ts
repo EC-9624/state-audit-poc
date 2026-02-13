@@ -18,6 +18,8 @@ export interface AnalyzerConfig {
   includeGlobs: string[];
   excludeGlobs: string[];
   format: OutputFormat;
+  profile: import("./profiles").AnalyzerProfile;
+  capabilities: import("./profiles").CapabilityFlags;
 }
 
 export interface StateSymbol {
