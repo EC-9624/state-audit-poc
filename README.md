@@ -39,6 +39,93 @@ pnpm state:audit --root "$ROOT" --profile extended
 pnpm state:impact --root "$ROOT" --profile extended --state pressReleaseBodyJsonState --format json
 ```
 
+## Architecture at a Glance
+
+Primary flow (ASCII):
+
+```text
++--------------------------------------------------------------------+
+| CLI entry                                                          |
+| `pnpm state:audit` / `pnpm state:impact`                           |
+| (`src/cli/state-audit.ts`, `src/cli/state-impact.ts`)              |
++-------------------------------+------------------------------------+
+                                |
+                                v
++--------------------------------------------------------------------+
+| Parse args + build analyzer config                                 |
+| `src/core/config.ts`                                               |
+| - root / tsconfig / include / exclude / format / profile           |
+| - profile => capabilities                                           |
++-------------------------------+------------------------------------+
+                                |
+                                v
++--------------------------------------------------------------------+
+| Load ts-morph project + scoped source files                        |
+| `src/core/project.ts`                                              |
++-------------------------------+------------------------------------+
+                                |
+                                v
++--------------------------------------------------------------------+
+| Build symbol index                                                  |
+| `src/core/symbols.ts`                                              |
+| - states, stateById, initCallByStateId, import maps               |
++-------------------------------+------------------------------------+
+                                |
+                                v
++--------------------------------------------------------------------+
+| Build usage/dependency events pipeline                             |
+| `src/core/events/pipeline.ts`                                      |
++-------------------------------+------------------------------------+
+                                |
+                                v
+      +--------------------------- Phase 1 ---------------------------+
+      | Shared bindings                                               |
+      | - setter bindings (direct or wrapper-aware)                  |
+      | - one-hop forwarding (optional)                              |
+      | - jotai store symbol keys (optional)                         |
+      +-------------------------------+-------------------------------+
+                                      |
+                                      v
+      +--------------------------- Phase 2 ---------------------------+
+      | Build `EventPipelineContext`                                 |
+      +-------------------------------+-------------------------------+
+                                      |
+                                      v
+      +--------------------------- Phase 3 ---------------------------+
+      | Run extractors                                                |
+      | - core: `direct-hooks`, `dependencies`                       |
+      | - ext : `callbacks` (optional)                               |
+      | - ext : `store-api` (optional)                               |
+      +-------------------------------+-------------------------------+
+                                      |
+                                      v
++--------------------------------------------------------------------+
+| Dedupe + sort                                                      |
+| => `usageEvents` + `dependencyEdges`                               |
++-------------------------------+------------------------------------+
+                                |
+              +-----------------+-----------------+
+              |                                   |
+              v                                   v
++-------------------------------+     +------------------------------+
+| Audit path                    |     | Impact path                  |
+| `src/core/analyzer.ts`        |     | `src/core/impact.ts`         |
+| - evaluate R001..R004         |     | - readers/writers            |
+| - build violations            |     | - reverse dependency BFS      |
++-------------------------------+     +------------------------------+
+              |                                   |
+              +-----------------+-----------------+
+                                |
+                                v
++--------------------------------------------------------------------+
+| Render output                                                      |
+| `src/core/reporter.ts`                                             |
+| - text / json                                                      |
++--------------------------------------------------------------------+
+```
+
+Detailed flow maps and the one-state lifecycle chart are in `docs/analyzer-architecture.md`.
+
 ## CLI Reference
 
 ### `state:audit`

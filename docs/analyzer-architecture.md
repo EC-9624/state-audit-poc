@@ -13,15 +13,87 @@ The design is intentionally split into focused modules so new extraction logic c
 
 ## End-to-End Flow
 
+ASCII flow:
+
 ```text
-CLI (state:audit | state:impact)
-  -> parse CLI args + build AnalyzerConfig
-  -> load ts-morph Project + in-scope source files
-  -> build state symbol index
-  -> build usage events + dependency edges
-  -> (audit) build reference index + evaluate R001-R004
-  -> (impact) resolve targets + collect direct/indirect impact
-  -> render text/json output
++--------------------------------------------------------------------+
+| CLI entry                                                          |
+| `pnpm state:audit` / `pnpm state:impact`                           |
+| (`src/cli/state-audit.ts`, `src/cli/state-impact.ts`)              |
++-------------------------------+------------------------------------+
+                                |
+                                v
++--------------------------------------------------------------------+
+| Parse args + build analyzer config                                 |
+| `src/core/config.ts`                                               |
+| - root / tsconfig / include / exclude / format / profile           |
+| - profile => capabilities                                           |
++-------------------------------+------------------------------------+
+                                |
+                                v
++--------------------------------------------------------------------+
+| Load ts-morph project + scoped source files                        |
+| `src/core/project.ts`                                              |
++-------------------------------+------------------------------------+
+                                |
+                                v
++--------------------------------------------------------------------+
+| Build symbol index                                                  |
+| `src/core/symbols.ts`                                              |
+| - states, stateById, initCallByStateId, import maps               |
++-------------------------------+------------------------------------+
+                                |
+                                v
++--------------------------------------------------------------------+
+| Build usage/dependency events pipeline                             |
+| `src/core/events/pipeline.ts`                                      |
++-------------------------------+------------------------------------+
+                                |
+                                v
+      +--------------------------- Phase 1 ---------------------------+
+      | Shared bindings                                               |
+      | - setter bindings (direct or wrapper-aware)                  |
+      | - one-hop forwarding (optional)                              |
+      | - jotai store symbol keys (optional)                         |
+      +-------------------------------+-------------------------------+
+                                      |
+                                      v
+      +--------------------------- Phase 2 ---------------------------+
+      | Build `EventPipelineContext`                                 |
+      +-------------------------------+-------------------------------+
+                                      |
+                                      v
+      +--------------------------- Phase 3 ---------------------------+
+      | Run extractors                                                |
+      | - core: `direct-hooks`, `dependencies`                       |
+      | - ext : `callbacks` (optional)                               |
+      | - ext : `store-api` (optional)                               |
+      +-------------------------------+-------------------------------+
+                                      |
+                                      v
++--------------------------------------------------------------------+
+| Dedupe + sort                                                      |
+| => `usageEvents` + `dependencyEdges`                               |
++-------------------------------+------------------------------------+
+                                |
+              +-----------------+-----------------+
+              |                                   |
+              v                                   v
++-------------------------------+     +------------------------------+
+| Audit path                    |     | Impact path                  |
+| `src/core/analyzer.ts`        |     | `src/core/impact.ts`         |
+| - evaluate R001..R004         |     | - readers/writers            |
+| - build violations            |     | - reverse dependency BFS      |
++-------------------------------+     +------------------------------+
+              |                                   |
+              +-----------------+-----------------+
+                                |
+                                v
++--------------------------------------------------------------------+
+| Render output                                                      |
+| `src/core/reporter.ts`                                             |
+| - text / json                                                      |
++--------------------------------------------------------------------+
 ```
 
 Core orchestration entry points:
@@ -96,28 +168,74 @@ src/core/
 
 Pipeline function: `buildUsageEvents` in `src/core/events/pipeline.ts`.
 
-```text
-Phase 1: Build shared bindings
-  - [storeApi] buildJotaiStoreSymbolKeys
-  - [wrappers] buildSetterBindings vs buildDirectSetterBindings
-  - [forwarding] propagateSetterBindingsOneHop
-
-Phase 2: Build EventPipelineContext
-
-Phase 3: Assemble extractors
-  - always: coreDirectHooksExtractor, coreDependenciesExtractor
-  - [callbacks]: callbacksExtractor
-  - [storeApi]: storeApiExtractor
-
-Phase 4: Run extractors and collect outputs
-
-Phase 5: Dedupe + sort outputs for deterministic results
-```
-
-Pipeline outputs:
+Outputs:
 
 - `usageEvents`: `read`, `runtimeWrite`, `initWrite`
 - `dependencyEdges`: `fromStateId -> toStateId` edges
+
+## Single-State Lifecycle Example
+
+Example target: `pressReleaseBodyJsonState` in `press-release-editor-v3`.
+
+ASCII flow:
+
+```text
++--------------------------------------------------------------------------------------+
+| 1) State Declaration                                                                 |
+| `.../states/contents.ts:119`                                                         |
+| pressReleaseBodyJsonState = atom<JSONContent | null>({ default: null })              |
++-------------------------------------------+------------------------------------------+
+                                            |
+                                            v
++--------------------------------------------------------------------------------------+
+| 2) Symbol Indexing (`src/core/symbols.ts`)                                           |
+| - classify factory: recoil:atom                                                      |
+| - create state id: `.../states/contents.ts::pressReleaseBodyJsonState`               |
+| - store metadata in stateById / declarationByStateId / initCallByStateId             |
++-------------------------------------------+------------------------------------------+
+                                            |
+                                            v
++--------------------------------------------------------------------------------------+
+| 3) Setter Binding Phase (`src/core/events/pipeline.ts`)                              |
+| direct binding found:                                                                 |
+| - `.../hooks/use-editor/index.ts:43`  useSetRecoilState(pressReleaseBodyJsonState)   |
+| wrapper binding found (extended):                                                     |
+| - `.../states/contents.ts:124` useSetPressReleaseBodyJson()                          |
+| - used at `.../pages/step1/Header/index.tsx:67` then called at line 108              |
++-------------------------------------------+------------------------------------------+
+                                            |
+                                            v
++--------------------------------------------------------------------------------------+
+| 4) Event Extraction                                                                   |
+| A) Direct hooks (`src/core/events/core/direct-hooks.ts`)                             |
+|    - runtime read: `.../validations/step1/index.ts:70` (useRecoilValue)              |
+|    - runtime writes: `.../hooks/use-editor/index.ts:102,122` (setter calls)          |
+|    - runtime write: `.../pages/step1/Header/index.tsx:108` (wrapper setter call)     |
+| B) Dependencies (`src/core/events/core/dependencies.ts`)                             |
+|    - dependency read: `.../states/images.ts:417` get(pressReleaseBodyJsonState)      |
+|    - edge: pressReleaseAdditionalImageAtomIdList -> pressReleaseBodyJsonState         |
++-------------------------------------------+------------------------------------------+
+                                            |
+                                            v
++--------------------------------------------------------------------------------------+
+| 5) Normalize                                                                          |
+| dedupe + sort usageEvents and dependencyEdges                                         |
++-------------------------------------------+------------------------------------------+
+                                            |
+                                            v
++--------------------------------------------------------------------------------------+
+| 6) Rule Evaluation (`src/core/rules/*`)                                               |
+| R004: runtimeReads=1, runtimeWrites=3, initWrites=0 => PASS                          |
+| R003: exported with references (7) => PASS                                            |
+| R001/R002: not applicable for this atom                                               |
++-------------------------------------------+------------------------------------------+
+                                            |
+                                            v
++--------------------------------------------------------------------------------------+
+| 7) Impact Output (`src/core/impact.ts`)                                               |
+| directReaders=2, runtimeWriters=3, initWriters=0, transitiveDependents=1             |
++--------------------------------------------------------------------------------------+
+```
 
 ## Rule Evaluation Model
 
