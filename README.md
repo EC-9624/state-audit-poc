@@ -15,8 +15,8 @@ Real project example:
 
 ```bash
 ROOT="path-to-project"
-pnpm state:audit --root "$ROOT" --profile press-release
-pnpm state:impact --root "$ROOT" --profile press-release --state pressReleaseBodyJsonState --format json
+pnpm state:audit --root "$ROOT" --profile extended
+pnpm state:impact --root "$ROOT" --profile extended --state pressReleaseBodyJsonState --format json
 ```
 
 ## CLI
@@ -27,7 +27,7 @@ Options:
 
 - `--root <path>`
 - `--tsconfig <path>` (optional; if omitted, auto-detects nearest `tsconfig.json` by walking up from `--root`, then falls back to `./tsconfig.json`)
-- `--profile core|press-release` (default: `press-release`)
+- `--profile core|extended` (default: `extended`)
 - `--format text|json` (default: `text`)
 - `--include <glob>` (repeatable or comma-separated)
 - `--exclude <glob>` (repeatable or comma-separated)
@@ -49,7 +49,7 @@ Options:
 
 - `--root <path>`
 - `--tsconfig <path>` (optional; if omitted, auto-detects nearest `tsconfig.json` by walking up from `--root`, then falls back to `./tsconfig.json`)
-- `--profile core|press-release` (default: `press-release`)
+- `--profile core|extended` (default: `extended`)
 - `--depth <n>`
 - `--format text|json`
 
@@ -65,7 +65,7 @@ For monorepos, set `--root` to the target app/feature path so auto-detection pic
 
 ### Profiles
 
-- `press-release`: full capability mode (callbacks, wrappers, forwarding, store API)
+- `extended`: full capability mode (callbacks, wrappers, forwarding, store API)
 - `core`: direct hooks + dependency extraction only
 
 ## Rules

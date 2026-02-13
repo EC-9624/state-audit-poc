@@ -30,24 +30,24 @@ The analyzer supports two profiles that control which capabilities are enabled:
 
 | Profile          | CLI default? | Capabilities enabled                       |
 |------------------|-------------|---------------------------------------------|
-| `press-release`  | Yes         | All (callbacks, wrappers, forwarding, storeApi) |
+| `extended`       | Yes         | All (callbacks, wrappers, forwarding, storeApi) |
 | `core`           | No          | None — direct hooks and dependencies only   |
 
-Defined in `src/core/profiles.ts`. The `press-release` profile is the default to preserve backward compatibility and full accuracy. The `core` profile provides a simpler, faster analysis that only detects direct Recoil/Jotai hook calls and selector dependency edges.
+Defined in `src/core/profiles.ts`. The `extended` profile is the default to preserve backward compatibility and full accuracy. The `core` profile provides a simpler, faster analysis that only detects direct Recoil/Jotai hook calls and selector dependency edges.
 
 **Profile impact on real codebase** (`press-release-editor-v3`, using app tsconfig resolution):
-- `press-release`: 7 violations (1 R001, 1 R003, 5 R004)
+- `extended`: 7 violations (1 R001, 1 R003, 5 R004)
 - `core`: 29 violations (0 R001, 1 R003, 28 R004)
 
 Interpretation of the delta:
 - `core` misses 1 R001 cross-store dependency (store-api capability disabled)
-- `core` reports 23 additional R004 issues that `press-release` resolves via wrappers/callbacks/forwarding support
+- `core` reports 23 additional R004 issues that `extended` resolves via wrappers/callbacks/forwarding support
 
 To reproduce these numbers, run from `state-audit-poc` with:
 
 ```bash
 ROOT="/Users/eakudompong.chanoknan/prtimes-dev-docker/prtimes-frontend/src/apps/prtimes/src/features/press-release-editor-v3"
-pnpm state:audit --root "$ROOT" --profile press-release --format json
+pnpm state:audit --root "$ROOT" --profile extended --format json
 pnpm state:audit --root "$ROOT" --profile core --format json
 ```
 
@@ -216,7 +216,7 @@ This feature is wrapper-heavy and callback-heavy. That is why the analyzer needs
 - callback-aware read/write extraction
 - dependency extraction that handles selector method and atom default-selector forms
 
-Without those, impact and R004 become noisy or incomplete — as demonstrated by the 23 extra R004 violations in `core` profile vs `press-release` profile on `press-release-editor-v3`.
+Without those, impact and R004 become noisy or incomplete — as demonstrated by the 23 extra R004 violations in `core` profile vs `extended` profile on `press-release-editor-v3`.
 
 ## Practical Maintenance Notes
 

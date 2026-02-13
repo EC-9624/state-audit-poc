@@ -83,7 +83,7 @@ function createDefaultConfig(): AnalyzerConfig {
     includeGlobs: ["**/*.{ts,tsx}"],
     excludeGlobs: [],
     format: "text",
-    profile: "press-release",
+    profile: "extended",
     capabilities: {
       callbacks: true,
       wrappers: true,

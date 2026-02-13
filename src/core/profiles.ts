@@ -1,4 +1,4 @@
-export type AnalyzerProfile = "core" | "press-release";
+export type AnalyzerProfile = "core" | "extended";
 
 export interface CapabilityFlags {
   callbacks: boolean;
@@ -14,7 +14,7 @@ const FLAGS: Record<AnalyzerProfile, CapabilityFlags> = {
     forwarding: false,
     storeApi: false,
   },
-  "press-release": {
+  extended: {
     callbacks: true,
     wrappers: true,
     forwarding: true,
@@ -23,8 +23,8 @@ const FLAGS: Record<AnalyzerProfile, CapabilityFlags> = {
 };
 
 export function resolveProfile(input?: string): AnalyzerProfile {
-  if (!input || input === "press-release") {
-    return "press-release";
+  if (!input || input === "extended") {
+    return "extended";
   }
   if (input === "core") {
     return "core";
