@@ -35,8 +35,8 @@ Real project example:
 
 ```bash
 ROOT="/path/to/project"
-pnpm state:audit --root "$ROOT" --profile extended
-pnpm state:impact --root "$ROOT" --profile extended --state pressReleaseBodyJsonState --format json
+pnpm state:audit --root "$ROOT"
+pnpm state:impact --root "$ROOT" --state pressReleaseBodyJsonState --format json
 ```
 
 ## Architecture at a Glance
@@ -229,10 +229,10 @@ Custom `--exclude` globs are appended to defaults.
 
 ## Profiles and Capabilities
 
-| Profile | callbacks | wrappers | forwarding | storeApi |
-| --- | --- | --- | --- | --- |
-| `extended` (default) | on | on | on | on |
-| `core` | off | off | off | off |
+| Profile              | callbacks | wrappers | forwarding | storeApi |
+| -------------------- | --------- | -------- | ---------- | -------- |
+| `extended` (default) | on        | on       | on         | on       |
+| `core`               | off       | off      | off        | off      |
 
 Defined in `src/core/profiles.ts`.
 
@@ -251,26 +251,26 @@ The fixture test harness (`src/cli/run-fixtures.ts`) runs the analyzer against e
 
 Current fixture matrix:
 
-| Fixture | Expected |
-| --- | --- |
-| `C01_R001_recoil_selector_reads_jotai` | fail `R001` |
-| `C02_R002_jotai_derived_reads_recoil` | fail `R002` |
-| `C03_R003_dead_recoil_state` | fail `R003` |
-| `C04_R004_stale_recoil_runtime_readonly` | fail `R004` |
-| `C05_PASS_valid_mixed_migration` | pass |
-| `C06_PASS_recoil_atom_selector_default_exempt` | pass |
-| `C07_R003_test_story_refs_ignored` | fail `R003` |
-| `C08_PASS_recoil_callback_alias_set_write` | pass |
-| `C09_PASS_recoil_callback_reset_write` | pass |
-| `C10_R004_init_helper_write_excluded` | fail `R004` |
-| `C11_PASS_use_reset_recoil_state_call` | pass |
-| `C12_R004_snapshot_get_promise_readonly` | fail `R004` |
-| `C13_PASS_wrapper_use_set_recoil_state` | pass |
-| `C14_PASS_object_wrapper_state_hook` | pass |
-| `C15_PASS_one_hop_prop_forwarding` | pass |
-| `C16_PASS_one_hop_function_arg_forwarding` | pass |
-| `C17_R001_selector_method_get_reads_jotai` | fail `R001` |
-| `C18_R001_selector_store_get_reads_jotai` | fail `R001` |
+| Fixture                                        | Expected    |
+| ---------------------------------------------- | ----------- |
+| `C01_R001_recoil_selector_reads_jotai`         | fail `R001` |
+| `C02_R002_jotai_derived_reads_recoil`          | fail `R002` |
+| `C03_R003_dead_recoil_state`                   | fail `R003` |
+| `C04_R004_stale_recoil_runtime_readonly`       | fail `R004` |
+| `C05_PASS_valid_mixed_migration`               | pass        |
+| `C06_PASS_recoil_atom_selector_default_exempt` | pass        |
+| `C07_R003_test_story_refs_ignored`             | fail `R003` |
+| `C08_PASS_recoil_callback_alias_set_write`     | pass        |
+| `C09_PASS_recoil_callback_reset_write`         | pass        |
+| `C10_R004_init_helper_write_excluded`          | fail `R004` |
+| `C11_PASS_use_reset_recoil_state_call`         | pass        |
+| `C12_R004_snapshot_get_promise_readonly`       | fail `R004` |
+| `C13_PASS_wrapper_use_set_recoil_state`        | pass        |
+| `C14_PASS_object_wrapper_state_hook`           | pass        |
+| `C15_PASS_one_hop_prop_forwarding`             | pass        |
+| `C16_PASS_one_hop_function_arg_forwarding`     | pass        |
+| `C17_R001_selector_method_get_reads_jotai`     | fail `R001` |
+| `C18_R001_selector_store_get_reads_jotai`      | fail `R001` |
 
 ## Project Layout
 
